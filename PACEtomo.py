@@ -95,7 +95,7 @@ parabolTh       = 9         # refineGeo: minimum number of passable CtfFind valu
 imageShiftLimit = 20        # maximum image shift [microns] SerialEM is allowed to apply (this is a SerialEM property entry, default is 15 microns)
 dataPoints      = 4         # number of recent specimen shift data points used for estimation of eucentric offset (default: 4)
 alignLimit      = 0.5       # maximum shift [microns] allowed for record tracking between tilts, should reduce loss of target in case of low contrast (not applied for tracking TS); also the threshold to take a second tracking image when using trackTwice
-reAlignISLimit         = 0.5       # maximum residual image shift [microns] allowed at the tracking target after the initial realignment; if exceeded, the image shift is reset (stage move via ResetImageShift) and the target realigned with View until the IS is below this limit, so that the IS of the other targets in the group stays within imageShiftLimit
+resetIS_AlignTo_Limit  = 0.5    # maximum residual image shift [microns] allowed at the tracking target after the initial realignment; if exceeded, the image shift is reset (stage move via ResetImageShift) and the target realigned with View until the IS is below this limit, so that the IS of the other targets in the group stays within imageShiftLimit
 minCounts       = 0         # minimum mean counts per second of record image (if set > 0, tilt series branch will be aborted if mean counts are not sufficient)
 ignoreNegStart  = True      # ignore first shift on 2nd branch, which is usually very large on bad stages
 realignToItem   = False     # Use SerialEM's RealignToItem routine instead of simple image realignment (was default in PACEtomo <=v1.9.1)
@@ -603,6 +603,35 @@ def realignTo(nav_id=None, target=None):
         sem.RealignToOtherItem(nav_id, 1)
     else:
         log(f"WARNING: No target provided for realignment!")
+
+def resetIS_AlignTo_Limit(target):
+    """Reduce the residual image shift at the tracking target to below resetIS_AlignTo_Limit so the
+    image shifts of the other targets in the group stay within imageShiftLimit. Called once per
+    exposure group (tracking position), after realignment. ResetImageShift moves the stage to
+    compensate the IS; the target is then realigned with View and the IS re-checked, repeating
+    until it is below the limit. If the limit cannot be reached within the maximum number of
+    attempts, the IS needed for alignment is kept and the acquisition continues anyway, so that
+    at least targets close to the tracking position can be collected at the defined positions."""
+
+    sem.GoToLowDoseArea("R")
+    for isIter in range(10):
+        ISX, ISY, *_ = sem.ReportImageShift()
+        if abs(ISX) < resetIS_AlignTo_Limit and abs(ISY) < resetIS_AlignTo_Limit:
+            break
+        log(f"Resetting image shift: {ISX}, {ISY} um exceeds limit ({resetIS_AlignTo_Limit} um). Moving stage to compensate and realigning...")
+        sem.ResetImageShift()
+        if "viewfile" in target.keys():
+            sem.ReadOtherFile(0, "O", target["viewfile"])
+            sem.V()
+            alignTo("O", debug)
+            ASX, ASY = sem.ReportAlignShift()[4:6]
+            log(f"Alignment (View) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
+        else:
+            log("WARNING: No view file for tracking target. Cannot realign after ResetImageShift!")
+            break
+        sem.GoToLowDoseArea("R")
+    else:
+        log(f"WARNING: Image shift still exceeds the limit ({resetIS_AlignTo_Limit} um) after {isIter + 1} attempts. Keeping the IS needed for alignment and continuing with the acquisition.")
 
 def log(text, color=0, style=0):
     if text.startswith("DEBUG:") and not debug:
@@ -1329,29 +1358,7 @@ if not recover:
         #sem.RealignToOtherItem(navID, 1) # <= sometimes unreliable
         realignTo(nav_id=navID, target=targets[0])
 
-        # Minimize the residual image shift (IS) at the tracking target: if the realignment
-        # leaves a large IS (e.g. owing to per-move stage offsets), adding the IS of the other
-        # targets in the group could exceed the microscope IS limit (imageShiftLimit).
-        # ResetImageShift moves the stage to compensate the IS; then realign with View and
-        # repeat until the IS is below reAlignISLimit, so the baseline IS is as close to 0 as possible.
-        if not tgtPattern:
-            sem.GoToLowDoseArea("R")
-            for isIter in range(10):
-                ISX, ISY, *_ = sem.ReportImageShift()
-                if abs(ISX) < reAlignISLimit and abs(ISY) < reAlignISLimit:
-                    break
-                log(f"Resetting image shift: {ISX}, {ISY} um exceeds limit ({reAlignISLimit} um). Moving stage to compensate and realigning with View...")
-                sem.ResetImageShift()
-                if "viewfile" in targets[0].keys():
-                    sem.ReadOtherFile(0, "O", targets[0]["viewfile"])
-                    sem.V()
-                    alignTo("O", debug)
-                    ASX, ASY = sem.ReportAlignShift()[4:6]
-                    log(f"Alignment (View) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
-                else:
-                    log("WARNING: No view file for tracking target. Cannot realign after ResetImageShift!")
-                    break
-                sem.GoToLowDoseArea("R")
+    resetIS_AlignTo_Limit(targets[0])                                                           # zero residual IS at the tracking target (once per exposure group)
 
     if measureGeo:
         log("Measuring geometry...")
@@ -1685,6 +1692,7 @@ else:
             sem.RestoreCameraSet("V")
         else:
             sem.RealignToOtherItem(navID, 1)
+        resetIS_AlignTo_Limit(targets[0])                                                     # zero residual IS at the tracking target (once per exposure group)
     position = []
     skippedTgts = 0
     for pos in range(len(targets)):
