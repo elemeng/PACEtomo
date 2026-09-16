@@ -7,7 +7,7 @@
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
 # Revision:     v1.9.3
-# Last Change:  2026/09/16: replaced sem.Eucentricity(1) with fine eucentric Z refinement like Z_byV fineMag=1 (Record-area autofocus defocus)
+# Last Change:  2026/09/16: replaced sem.Eucentricity(1) with fine eucentric Z refinement like Z_byV fineMag=1 (Record-area autofocus defocus); added IS reset loop after target realign
 #               2026/08/27: v1.9.3 release
 #               2026/05/13: added check for pixel sizes befor calling AlignBetweenMAgs
 #               2026/03/22: added _0_0 suffix to central montage piece
@@ -95,6 +95,7 @@ parabolTh       = 9         # refineGeo: minimum number of passable CtfFind valu
 imageShiftLimit = 20        # maximum image shift [microns] SerialEM is allowed to apply (this is a SerialEM property entry, default is 15 microns)
 dataPoints      = 4         # number of recent specimen shift data points used for estimation of eucentric offset (default: 4)
 alignLimit      = 0.5       # maximum shift [microns] allowed for record tracking between tilts, should reduce loss of target in case of low contrast (not applied for tracking TS); also the threshold to take a second tracking image when using trackTwice
+reAlignISLimit         = 0.5       # maximum residual image shift [microns] allowed at the tracking target after the initial realignment; if exceeded, the image shift is reset (stage move via ResetImageShift) and the target realigned with View until the IS is below this limit, so that the IS of the other targets in the group stays within imageShiftLimit
 minCounts       = 0         # minimum mean counts per second of record image (if set > 0, tilt series branch will be aborted if mean counts are not sufficient)
 ignoreNegStart  = True      # ignore first shift on 2nd branch, which is usually very large on bad stages
 realignToItem   = False     # Use SerialEM's RealignToItem routine instead of simple image realignment (was default in PACEtomo <=v1.9.1)
@@ -1327,6 +1328,30 @@ if not recover:
     else:
         #sem.RealignToOtherItem(navID, 1) # <= sometimes unreliable
         realignTo(nav_id=navID, target=targets[0])
+
+        # Minimize the residual image shift (IS) at the tracking target: if the realignment
+        # leaves a large IS (e.g. owing to per-move stage offsets), adding the IS of the other
+        # targets in the group could exceed the microscope IS limit (imageShiftLimit).
+        # ResetImageShift moves the stage to compensate the IS; then realign with View and
+        # repeat until the IS is below reAlignISLimit, so the baseline IS is as close to 0 as possible.
+        if not tgtPattern:
+            sem.GoToLowDoseArea("R")
+            for isIter in range(10):
+                ISX, ISY, *_ = sem.ReportImageShift()
+                if abs(ISX) < reAlignISLimit and abs(ISY) < reAlignISLimit:
+                    break
+                log(f"Resetting image shift: {ISX}, {ISY} um exceeds limit ({reAlignISLimit} um). Moving stage to compensate and realigning with View...")
+                sem.ResetImageShift()
+                if "viewfile" in targets[0].keys():
+                    sem.ReadOtherFile(0, "O", targets[0]["viewfile"])
+                    sem.V()
+                    alignTo("O", debug)
+                    ASX, ASY = sem.ReportAlignShift()[4:6]
+                    log(f"Alignment (View) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
+                else:
+                    log("WARNING: No view file for tracking target. Cannot realign after ResetImageShift!")
+                    break
+                sem.GoToLowDoseArea("R")
 
     if measureGeo:
         log("Measuring geometry...")
