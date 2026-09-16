@@ -192,7 +192,7 @@ If you made any changes, please don't forget to click *Save*. Once you are done 
 
 ### Acquisition
 
-PACEtomo runs a grouped dose-symmetric tilt scheme. Before starting the PACEtomo collection, please check the settings inside the *PACEtomo.py* script. Most settings are self-explanatory, but here is a more detailed description for some of them:
+PACEtomo runs a grouped dose-symmetric tilt scheme. With `freeStartTilt` enabled (default), the first three exposures are taken at the `startTilt` and one `step` to either side of it (e.g. 0°, -3°, +3°), before the grouped scheme continues on both branches. This way the first branch switch happens at the smallest tilt angles, where both early branches still align to the `startTilt` reference image, which reduces the off-target drift that is usually observed at the first branch switch. Before starting the PACEtomo collection, please check the settings inside the *PACEtomo.py* script. Most settings are self-explanatory, but here is a more detailed description for some of them:
 
 | Setting | Default | Description |
 | ------- | ------- | ----------- |
@@ -201,6 +201,7 @@ PACEtomo runs a grouped dose-symmetric tilt scheme. Before starting the PACEtomo
 | `maxTilt` | `60`  | Maximum tilt angle [degrees] of the tilt series. The tilt series branches do not have to be symmetrical.|
 | `step` | `3` | Tilt angle increment [degrees] between tilt images. |
 | `groupSize` | `2` | The number of contiguously acquired tilt images on one branch of the tilt series. |
+| `freeStartTilt` | `True` | Take the first three exposures as `startTilt`, `startTilt - step` and `startTilt + step` before starting the grouped scheme, so that the first branch switch happens at the smallest angles (`2 * step`) while both early branches still align to the `startTilt` reference. Reduces the large off-target usually observed at the first branch switch, when the eucentric offset prediction is still unrefined. |
 | `minDefocus` | `-5` | Minimum target defocus [µm] of a defocus range that is incremented between targets. |
 | `maxDefocus` | `-5` | Maximum target defocus [µm] of a defocus range that is incremented between targets. If you want to use the same target defocus, keep `minDefocus` and `maxDefocus` the same. |
 | `stepDefocus` | `0.5` | Defocus increment [µm] between targets. |
@@ -259,6 +260,7 @@ PACEtomo runs a grouped dose-symmetric tilt scheme. Before starting the PACEtomo
 | Setting | Default | Description |
 | ------- | ------- | ----------- |
 | `slowTilt` | `False` | `slowTilt` should only be set to `True` if you need additional tilt backlash corrections for the positive tilt branch, which should not be necessary for good stages. |
+| `swingBreakAngle` | `30` | Maximum stage tilt movement [degrees] in a single swing between two exposures. Larger swings (mainly the branch switches, which grow with tilt angle) are split into intermediate moves without taking images in between, so no single tilt move exceeds this angle. This can substantially reduce off-target drift on stages whose positional error scales with the move size (e.g. JEOL cryoARM); set to `0` to disable. |
 | `taOffsetPos` | `0` | Additional tilt axis offset [µm] for the positive tilt series branch (as used for the side-entry holder dataset in the PACEtomo manuscript). These offsets are applied on top of the global offset set in SerialEM and are only used for the internal calculations. |
 | `taOffsetNeg` | `0` | Additional tilt axis offset [µm] for the negative tilt series branch. |
 | `checkDewar` | `True` | If `True`, PACEtomo will check if the microscope dewars are filling before taking a Record image. (Can cause weird behavior on some microscope without a monitored dewar (e.g. JEOL F200).) |
@@ -393,6 +395,8 @@ Fine eucentric Z refinement and improved target centring.
 
 - Replaced the coarse `sem.Eucentricity()` routine at the tracking target with a fine eucentric Z refinement: the script measures the defocus with SerialEM's autofocus in the Record low-dose area (beam-tilt based, like the fine step of the *z_by_v* script) and moves the stage Z by the defocus error until it is within `eucentricTol` (default 0.5 µm), then writes the refined Z into the tracking Navigator item. The coarse routine could leave the target up to ~3 µm off, contributing to off-target acquisition.
 - Added `eucentricTol` and `eucentricTargetDefocus` settings.
+- Added `freeStartTilt` (default `True`): the first three exposures are now taken at `startTilt`, `startTilt - step` and `startTilt + step` before the grouped dose-symmetric scheme continues. The first branch switch therefore happens at the smallest angles (`2 * step`) while both early branches still align to the `startTilt` reference, reducing the large off-target usually observed at the first branch switch.
+- Added `swingBreakAngle` (default 30°): large tilt swings between exposures (mainly the branch switches at high tilt) are split into intermediate moves of at most this angle, without taking images in between. Reduces off-target caused by large single tilt moves on stages with move-size dependent positioning errors.
 - Recommended workflow: correct the eucentric height of the lamella before taking the map on which the targets are added (e.g. with the new *PACEtomo_Z_by_V.py* script), so PACEtomo only needs a quick fine correction before each tilt series.
 
 #### PACEtomo_Z_by_V.py [v1.0]

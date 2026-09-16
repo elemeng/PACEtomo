@@ -7,7 +7,8 @@
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
 # Revision:     v1.9.3
-# Last Change:  2026/09/16: replaced sem.Eucentricity(1) with fine eucentric Z refinement like Z_byV fineMag=1 (Record-area autofocus defocus); added IS reset loop after target realign
+# Last Change:  2026/09/16: added freeStartTilt (first three exposures startTilt, startTilt - step, startTilt + step before the grouped scheme) and swingBreakAngle (large tilt swings split into intermediate moves)
+#               2026/09/16: replaced sem.Eucentricity(1) with fine eucentric Z refinement like Z_byV fineMag=1 (Record-area autofocus defocus); added IS reset loop after target realign
 #               2026/08/27: v1.9.3 release
 #               2026/05/13: added check for pixel sizes befor calling AlignBetweenMAgs
 #               2026/03/22: added _0_0 suffix to central montage piece
@@ -25,6 +26,7 @@ minTilt         = -60       # minimum absolute tilt angle [degrees]
 maxTilt         = 60        # maximum absolute tilt angle [degrees]
 step            = 3         # tilt step [degrees]
 groupSize       = 2         # group size for grouped dose-symmetric scheme (number of contiguously acquired images on one side of the tilt series)
+freeStartTilt   = True      # take the first three exposures as startTilt, startTilt - step and startTilt + step before starting the grouped scheme, so the first branch switch happens at the smallest angles (2 * step) when both early branches still align to the startTilt reference (reduces the large off-target usually observed at the first branch switch)
 minDefocus      = -5        # minimum defocus [microns] of target range (low defocus)
 maxDefocus      = -5        # maximum defocus [microns] of target range (high defocus)
 stepDefocus     = 0.5       # step [microns] between target defoci (between TS)
@@ -81,6 +83,7 @@ extendedMdoc    = True      # saves additional info to .mdoc file
 
 # Hardware settings
 slowTilt        = False     # do backlash step for all tilt angles, on bad stages large tilt steps are less accurate
+swingBreakAngle = 30        # maximum stage tilt movement [degrees] in one swing between exposures; larger swings are split into intermediate moves (no images taken in between) to reduce off-target caused by large tilt moves, 0 disables splitting
 taOffsetPos     = 0         # additional tilt axis offset values [microns] applied to calculations for positive and...
 taOffsetNeg     = 0         # ...negative branch of the tilt series (possibly useful for side-entry holder systems)
 checkDewar      = True      # check if dewars are refilling before every acquisition
@@ -633,6 +636,19 @@ def resetIS_AlignTo_Limit(target):
     else:
         log(f"WARNING: Image shift still exceeds the limit ({resetIS_AlignTo_Limit} um) after {isIter + 1} attempts. Keeping the IS needed for alignment and continuing with the acquisition.")
 
+def tiltToBreaks(tilt):
+    """Move the stage to `tilt`, splitting large swings into moves of at most swingBreakAngle degrees
+    (no images are taken in between). Reduces off-target caused by large single tilt moves, e.g. on
+    stages where the positional error scales with the move size."""
+    if swingBreakAngle <= 0 or abs(tilt - float(sem.ReportTiltAngle())) <= swingBreakAngle:
+        sem.TiltTo(tilt)
+        return
+    cur = float(sem.ReportTiltAngle())
+    while abs(tilt - cur) > swingBreakAngle:
+        cur += np.sign(tilt - cur) * swingBreakAngle
+        sem.TiltTo(cur)
+    sem.TiltTo(tilt)
+
 def log(text, color=0, style=0):
     if text.startswith("DEBUG:") and not debug:
         return
@@ -719,7 +735,7 @@ def Tilt(tilt):
     # Tilt if within tilt range, skip branch if not
     if -tiltLimit <= tilt <= tiltLimit:
         if tilt != startTilt:
-            sem.TiltTo(tilt)
+            tiltToBreaks(tilt)
         skip_branch = False
     else:
         log(f"WARNING: Tilt angle [{tilt} degrees] could not be reached. This branch of the tilt series will be aborted.")
@@ -729,12 +745,12 @@ def Tilt(tilt):
         increment = -step
         if tilt - step >= -tiltLimit:
             sem.TiltBy(-step)
-            sem.TiltTo(tilt)
+            tiltToBreaks(tilt)
         pn = 2
     else:
         if slowTilt and startTilt < tilt <= tiltLimit:                                                       # on bad stages, better to do backlash as well to enhance accuracy
             sem.TiltBy(-step)
-            sem.TiltTo(tilt)
+            tiltToBreaks(tilt)
         increment = step
         pn = 1
 
@@ -1643,6 +1659,20 @@ if not recover:
     tiltStepCounter = 1
     Tilt(startTilt)
 
+    if freeStartTilt:
+        if startTilt - step >= minTilt:                                                         # take the first step of the negative branch as 2nd exposure...
+            tiltStepCounter += 1
+            sem.SetStatusLine(1, f"Tilt step: {tiltStepCounter} / {int((maxTilt - minTilt) / step + 1)}")
+            log(f"\nTilt step {tiltStepCounter} out of {int((maxTilt - minTilt) / step + 1)} ({startTilt - step} deg)...", style=1)
+            Tilt(startTilt - step)
+            minustilt = startTilt - step
+        if startTilt + step <= maxTilt:                                                         # ...and the first step of the positive branch as 3rd exposure, so the first branch switch is only 2 * step
+            tiltStepCounter += 1
+            sem.SetStatusLine(1, f"Tilt step: {tiltStepCounter} / {int((maxTilt - minTilt) / step + 1)}")
+            log(f"\nTilt step {tiltStepCounter} out of {int((maxTilt - minTilt) / step + 1)} ({startTilt + step} deg)...", style=1)
+            Tilt(startTilt + step)
+            plustilt = startTilt + step
+
     if refineGeo:
         if len(geo[2]) >= 3:                                                                    # if number of points > 3: fit z = a * x + b * y
             log("Refining geometry...")
@@ -1725,19 +1755,34 @@ else:
         if targets[pos]["skip"] == "True":
             skippedTgts += 1
 
-    startstep = (resume["sec"] - 1) // (2 * groupSize)                                          # figure out start values for branch loops
-    substep = [min((resume["sec"] - 1) % (2 * groupSize), groupSize), (resume["sec"] - 1) % (2 * groupSize) // (groupSize + 1)]
-
-    realTilt = float(savedRun[resume["pos"]][0]["angles"].split(",")[-1])
-    if np.floor(realTilt) % step == 0:                                                          # necessary because angles array was switched to realTilt
-        lastTilt = np.floor(realTilt)
+    # Figure out start values for branch loops relative to the collected sequence: with freeStartTilt
+    # there are 3 exposures before the loops (0, -step, +step), otherwise only the startTilt exposure
+    loopOffset = 3 if freeStartTilt else 1
+    loopImg = resume["sec"] - loopOffset                                                          # index of the collected image within the loop sequence
+    if loopImg < 0:                                                                              # ran stopped during the initial exposures
+        startstep = 0
+        substep = [0, 0]
     else:
-        lastTilt = np.ceil(realTilt)
-    plustilt = resumePlus = lastTilt                                                            # obtain last angle from savedRun in case position["angles"] was reset
-    if substep[0] < groupSize:                                                                  # subtract step when stopped during positive branch
-        plustilt -= step
-        resumePN = 1                                                                            # indicator which branch was interrupted
-        sem.TiltTo(plustilt)
+        startstep = loopImg // (2 * groupSize)
+        loopSubstep = loopImg % (2 * groupSize)
+        substep = [min(loopSubstep, groupSize), loopSubstep // (groupSize + 1)]
+
+    resumePN = 0                                                                                 # defaults for the shift-ignore conditions in case a branch was not started yet
+    resumePlus = resumeMinus = startTilt
+
+    if savedRun[resume["pos"]][0]["angles"] != "":
+        realTilt = float(savedRun[resume["pos"]][0]["angles"].split(",")[-1])
+        if np.floor(realTilt) % step == 0:                                                          # necessary because angles array was switched to realTilt
+            lastTilt = np.floor(realTilt)
+        else:
+            lastTilt = np.ceil(realTilt)
+        plustilt = resumePlus = lastTilt                                                            # obtain last angle from savedRun in case position["angles"] was reset
+        if substep[0] < groupSize:                                                                  # subtract step when stopped during positive branch
+            plustilt -= step
+            resumePN = 1                                                                            # indicator which branch was interrupted
+            sem.TiltTo(plustilt)
+    else:
+        plustilt = resumePlus = startTilt + (step if freeStartTilt else 0)                          # positive branch not started yet, resume with its first tilt
     if savedRun[pos][1]["angles"] != "":
         realTilt = float(savedRun[resume["pos"]][1]["angles"].split(",")[-1])
         if np.floor(realTilt) % step == 0:                                                      # necessary because angles array was switched to realTilt
@@ -1750,7 +1795,7 @@ else:
             resumePN = 2
             sem.TiltTo(minustilt)
     else:
-        minustilt = resumeMinus = startTilt
+        minustilt = resumeMinus = startTilt - (step if freeStartTilt else 0)
         resumePN = 1
 
     posResumed = resume["pos"] + 1
@@ -1777,6 +1822,20 @@ else:
         log(f"    Specimen to Camera: {ss2cMatrix}", color=1)
 
     focus0 = (position[0][1]["focus"] + position[0][2]["focus"]) / 2                            # get estimate for original microscope focus value by taking average of both branches of tracking target
+
+    if freeStartTilt and loopImg < 0:                                                           # ran stopped during the initial exposures: (re-)take them before the loops
+        if resume["sec"] == 0:
+            tiltStepCounter = 1                                                                 # only the startTilt exposure was collected
+        if resume["sec"] < 2:
+            tiltStepCounter += 1
+            log(f"\nTilt step {tiltStepCounter} out of {int((maxTilt - minTilt) / step + 1)} ({startTilt - step} deg)...", style=1)
+            Tilt(startTilt - step)
+        if resume["sec"] < 3:
+            tiltStepCounter += 1
+            log(f"\nTilt step {tiltStepCounter} out of {int((maxTilt - minTilt) / step + 1)} ({startTilt + step} deg)...", style=1)
+            Tilt(startTilt + step)
+        plustilt = startTilt + step
+        minustilt = startTilt - step
 
     startTime = sem.ReportClock()
     lastSlitCheck = startTime
