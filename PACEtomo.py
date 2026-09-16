@@ -7,7 +7,8 @@
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
 # Revision:     v1.9.3
-# Last Change:  2026/08/27: v1.9.3 release
+# Last Change:  2026/09/16: replaced sem.Eucentricity(1) with fine eucentric Z refinement like Z_byV fineMag=1 (Record-area autofocus defocus)
+#               2026/08/27: v1.9.3 release
 #               2026/05/13: added check for pixel sizes befor calling AlignBetweenMAgs
 #               2026/03/22: added _0_0 suffix to central montage piece
 #               2026/01/31: fixed tilt axis offset application in realignTo function 
@@ -45,6 +46,18 @@ trackUseTrial   = False     # Use Trial Low Dose Area for the tracking tilt seri
 pretilt         = 0         # pretilt [degrees] of sample in deg e.g. after FIB milling (if milling direction is not perpendicular to the tilt axis, estimate and add rotation)
 rotation        = 0         # rotation [degrees] of lamella vs tilt axis in deg (should be 0 deg if lamella is oriented perpendicular to tilt axis)
 measureGeo      = False     # estimates pretilt and rotation values of sample by measuring defocus on geo points saved in target setup or automatically determined points within tgt pattern
+
+# Eucentricity settings
+# Recommended workflow: add targets on a map that was taken at an already corrected eucentric Z
+# (corrected by SerialEM's eucentricity function or by the beam-tilt compensation method, e.g. the
+# Z_byV script). Do the rough eucentricity correction *before* taking the map (e.g. a lamella
+# montage), then add the targets on that map. Before each tilt series acquisition, this script
+# performs a fine eucentricity correction at the tracking target (autofocus defocus measurement in
+# the Record low-dose area with beam tilt compensation), which is quick, accurate and keeps the
+# targets centred on the positions you defined. A better eucentricity correction also reduces the
+# target-off drift that otherwise builds up at high tilt angles.
+eucentricTol    = 0.5       # convergence tolerance [um] of the fine eucentric Z refinement (like Z_byV with fineMag=1)
+eucentricTargetDefocus = 0  # target defocus [um] for the fine eucentric Z refinement (0 = eucentric focus)
 
 # Holey support settings
 tgtPattern      = False     # use same tgt pattern on different stage positions (useful for collection on holey support film)
@@ -1232,8 +1245,18 @@ if not recover:
     sem.SetCameraArea("V", "F")                                                                 # set View to Full for Eucentricity
     sem.MoveToNavItem(navID)
     log("Refining eucentricity...")
-    sem.Eucentricity(1)
+    sem.SaveFocus()
+    sem.SetEucentricFocus(1)                                                                     # set standard (eucentric) focus, suppress error if not calibrated
+    for eucIter in range(10):                                                                    # fine eucentric Z like Z_byV with fineMag=1
+        sem.G(-1, -1)                                                                            # measure defocus in the Record low-dose area
+        defocus, *_ = sem.ReportAutoFocus()
+        neededZ = defocus - eucentricTargetDefocus
+        log(f"Eucentric Z iteration {eucIter + 1}: defocus {defocus} um, correction {neededZ} um")
+        if abs(neededZ) < eucentricTol:                                                          # converged
+            break
+        sem.MoveStage(0, 0, -neededZ)                                                            # move Z to null the defocus error
     sem.UpdateItemZ()
+    sem.RestoreFocus()
     sem.RestoreCameraSet("V")
 
     log("Realigning to target 1...")

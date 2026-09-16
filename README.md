@@ -225,6 +225,8 @@ PACEtomo runs a grouped dose-symmetric tilt scheme. Before starting the PACEtomo
 | `pretilt`  | `0` | The `pretilt` [degrees] of the lamella (if applicable) is determined during the focused ion beam milling process and is usually between 8-15 degrees. The sign is important and depends on the orientation in which the grid was loaded into the microscope. For example, in case of a FIB milling angle of 10 degrees: If the lamella appears thinner/brighter at +10 degrees stage tilt angle, the pretilt value should be -10 degrees and vice versa. (It is recommended to load lamella containing grids consistently in the same orientation.) You can use the *measure geometry* routine in the target selection GUI to get an estimate of your lamella (or holey support) geometry. |
 | `rotation` | `0` | Lamellae should be oriented with the milling direction perpendicular to the tilt axis during sample loading. In this case the `rotation` should be 0 degrees. If there is a residual rotation you can estimate and enter it for the initial estimation of the eucentric offset [degrees, CCW = positive].
 | `measureGeo` | `False` | If *geo points* were defined during target selection or *targetPattern* was used, setting `measureGeometry = True` will allow PACEtomo to estimate the sample geometry immediately before acquiring an area. For target patterns, the script will automatically determine five points between the targets to measure the defocus and estimate the *pretilt* and *rotation* values of the sample support. This can be useful for bent sample supports exhibiting varying geometries from grid square to grid square. It should be avoided if the pattern is tight and additional exposures within the grid would overlap with target positions. It is also needed for [SPACEtomo](https://github.com/eisfabian/SPACEtomo). |
+| `eucentricTol` | `0.5` | Convergence tolerance [µm] of the fine eucentric Z refinement that is performed at the tracking target before the acquisition. The script measures the defocus with the autofocus routine in the Record low-dose area (like the fine step of the *z_by_v* script) and moves the stage Z by the defocus error until it is below this tolerance. It replaces the coarse `sem.Eucentricity()` routine, which could leave the target up to ~3 µm off. The refined Z is written back into the tracking Navigator item. |
+| `eucentricTargetDefocus` | `0` | Target defocus [µm] for the fine eucentric Z refinement (0 = eucentric focus; only needs adjusting if your Record low-dose area uses a nonzero defocus offset). |
 
 #### Holey support settings:
 | Setting | Default | Description |
@@ -317,7 +319,9 @@ Any numerical or boolean setting in the script can be overwritten by settings in
 
 #### Starting a run
 
-You can run the PACEtomo acquisition script either by selecting the entry of target 1 in the Navigator (its Note entry contains *rootname_tgts.txt*) and pressing *Run* in the script window or you can run it in batch via the *Acquire at Items...* dialogue. In the latter case, you can uncheck any eucentricity and realign checkboxes as the script will take care of it.
+You can run the PACEtomo acquisition script either by selecting the entry of target 1 in the Navigator (its Note entry contains *rootname_tgts.txt*) and pressing *Run* in the script window or you can run it in batch via the *Acquire at Items...* dialogue. In the latter case, you can uncheck any eucentricity and realign checkboxes as the script will take care of realignment.
+
+Before acquiring each area, the script performs a **fine eucentric Z refinement** at the tracking target: it measures the defocus with SerialEM's autofocus in the Record low-dose area (beam-tilt based, like the fine step of the *z_by_v* script) and moves the stage Z by the defocus error until it is within `eucentricTol`, then writes the refined Z into the tracking Navigator item. This replaces the coarse `sem.Eucentricity()` routine and keeps the targets centred on the positions you defined. The **recommended workflow** is to correct the eucentric height of the lamella *before* taking the map on which you add the targets (e.g. using SerialEM's eucentricity function or the [*PACEtomo_Z_by_V.py*](#pacetomo_z_by_vpy) beam-tilt compensation script before a lamella montage) — PACEtomo then only needs to do a quick fine correction before each tilt series.
 
 In case you want to run PACEtomo on a regular grid *targetPattern*, you can set all desired tracking stage positions to *Acquire* in the navigator and run the *PACEtomo_selectTargets.py* script on the original navigator item. Within the GUI, you can click *Copy to Acq* to copy the target file to all marked points. Alternatively, you can copy the targets file manually and edit the *Note* entry of all target positions to contain the target file name.
 
@@ -348,7 +352,15 @@ This script uses a group of navigator points, measures the z-height using the au
   - The first point will be used as the stage position so it should be somewhat centred.
   - Make sure to not surpass the beam shift limits of the microscope (usually within 20 μm).
   - Select the first point of the group and run the script.
- 
+
+#### [*PACEtomo_Z_by_V.py*](PACEtomo_Z_by_V.py)
+This is an eucentric Z correction script. It adjusts the stage Z to the eucentric height using the beam-tilt autofocus defocus measurement: first a coarse correction in the View low-dose area, then a fine correction either at the same mag (`fineMag = 0`, default) or in the Record area (`fineMag` non-zero, using the high mag from the low-dose Record configuration). It is meant to be run on the lamella *before* taking a map (e.g. a lamella montage) so that the targets you add on the map are at an already-corrected eucentric Z — PACEtomo will then only perform a quick fine correction before each tilt series.
+- How to use:
+  - Low dose mode should be set up and the Navigator open, as for target selection.
+  - Make sure the Autofocus dialog uses beam tilt (not CTF) so the defocus measurement works at low mag.
+  - The `beamTilt` setting (% of full scale on JEOL, milliradians on Thermo/FEI) controls the beam tilt amplitude used for the measurement. On the JEOL cryoARM, 5-10% converges much faster and more robustly than 0.5% (keep ≤10% for linearity).
+  - Run the script, wait for the "Finished Z_byV" message, and optionally run it again to check for a remaining offset (as recommended for `PACEtomo_measureOffset.py`).
+
 ## Video Tutorials
 A selection of video tutorials was uploaded to Youtube. These were recorded using older versions of PACEtomo and some features and settings might be missing. The general workflows, however, remain the same.
 
@@ -371,6 +383,20 @@ A selection of video tutorials was uploaded to Youtube. These were recorded usin
 If you could not resolve the issue yourself or you encountered a bug, please report it to the [GitHub Issues](https://github.com/eisfabian/PACEtomo/issues) page or send an email to [spacetomo.help@gmail.com](mailto:spacetomo.help@gmail.com).
 
 ## Recent changes
+
+### 16.09.2026
+#### PACEtomo.py [v1.9.3]
+Fine eucentric Z refinement and improved target centring.
+<details>
+<summary>Changes</summary>
+
+- Replaced the coarse `sem.Eucentricity()` routine at the tracking target with a fine eucentric Z refinement: the script measures the defocus with SerialEM's autofocus in the Record low-dose area (beam-tilt based, like the fine step of the *z_by_v* script) and moves the stage Z by the defocus error until it is within `eucentricTol` (default 0.5 µm), then writes the refined Z into the tracking Navigator item. The coarse routine could leave the target up to ~3 µm off, contributing to off-target acquisition.
+- Added `eucentricTol` and `eucentricTargetDefocus` settings.
+- Recommended workflow: correct the eucentric height of the lamella before taking the map on which the targets are added (e.g. with the new *PACEtomo_Z_by_V.py* script), so PACEtomo only needs a quick fine correction before each tilt series.
+
+#### PACEtomo_Z_by_V.py [v1.0]
+- New standalone Python version of the *z_by_v* eucentric Z correction script (no dependency on external SerialEM function libraries). Two steps: coarse at the View low-dose area, fine at the same mag or in the Record area (`fineMag`); beam tilt amplitude controlled via the `beamTilt` setting (`SetUserSetting AutofocusBeamTilt`).
+</details>
 
 ### 27.08.2026
 #### v1.9.3
