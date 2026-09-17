@@ -7,7 +7,7 @@
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
 # Revision:     v1.9.3
-# Last Change:  2026/09/17: made the in-script fine Z correction optional (fineZ setting; when False no Z correction at all, sem.Eucentricity() stays removed) + review refinements (switchAli fixed Preview anchor with View as independent check, streak display, correction/residual log lines, DEBUG tilt readback deviation, residual-Z wording + total Z log)
+# Last Change:  2026/09/17: review fixes — switchAli re-anchor correction propagated to all targets; targets whose measured image shift exceeds imageShiftLimit minus alignLimit are skipped during target setup (tracking target warns); plus fineZ option and review refinements (switchAli fixed Preview anchor with View as independent check, streak display, correction/residual log lines, DEBUG tilt readback deviation)
 #               2026/09/17: added switchAli (re-anchor tracking target at the first branch switch with View and Preview references), tgtAlignTol (retry + skip for failed target centering at startTilt) and maxAlignError (abort data target branch / warn for tracking target when accumulated alignment error exceeds the limit at any tilt)
 #               2026/09/16: added freeStartTilt (first three exposures startTilt, startTilt - step, startTilt + step before the grouped scheme) and swingBreakAngle (large tilt swings split into intermediate moves)
 #               2026/09/16: replaced sem.Eucentricity(1) with fine eucentric Z refinement like Z_byV fineMag=1 (Record-area autofocus defocus); added IS reset loop after target realign
@@ -632,7 +632,7 @@ def resetIS_AlignTo_Limit(target):
         ISX, ISY, *_ = sem.ReportImageShift()
         if abs(ISX) < resetIS_AlignTo_Limit and abs(ISY) < resetIS_AlignTo_Limit:
             break
-        log(f"Resetting image shift: {ISX}, {ISY} um exceeds limit ({resetIS_AlignTo_Limit} um). Moving stage to compensate and realigning...")
+        log(f"Resetting image shift: {round(ISX, 2)}, {round(ISY, 2)} um exceeds limit ({resetIS_AlignTo_Limit} um). Moving stage to compensate and realigning...")
         sem.ResetImageShift()
         if "viewfile" in target.keys():
             sem.ReadOtherFile(0, "O", target["viewfile"])
@@ -722,7 +722,16 @@ def reanchorTrackingAtSwitch(switchTilt, pn):
     anchorErr = prevErr if "tgtfile" in target.keys() else viewErr
     if anchorErr > tgtAlignTol:
         log(f"WARNING: Tracking target could not be re-anchored within the tolerance ({tgtAlignTol} nm) at the first branch switch. Continuing with the current alignment.")
-    position[0][pn]["ISXset"], position[0][pn]["ISYset"], *_ = sem.ReportImageShift()           # store re-anchored IS so the switch image uses it
+    oldISXset, oldISYset = position[0][pn]["ISXset"], position[0][pn]["ISYset"]                    # setpoint before the re-anchor, to compute the applied correction
+    position[0][pn]["ISXset"], position[0][pn]["ISYset"], *_ = sem.ReportImageShift()               # store re-anchored IS so the switch image uses it
+    dISX, dISY = position[0][pn]["ISXset"] - oldISXset, position[0][pn]["ISYset"] - oldISYset
+    if abs(dISX) > 0 or abs(dISY) > 0:                                                             # propagate the re-anchor correction to the other targets (shared drift) on both branches
+        for i in range(1, len(position)):
+            position[i][1]["ISXset"] += dISX
+            position[i][1]["ISYset"] += dISY
+            position[i][2]["ISXset"] += dISX
+            position[i][2]["ISYset"] += dISY
+        log(f"NOTE: Switch re-anchor correction propagated to all targets: x = {round(dISX, 2)} um | y = {round(dISY, 2)} um")
 
 def log(text, color=0, style=0):
     if text.startswith("DEBUG:") and not debug:
@@ -847,7 +856,7 @@ def Tilt(tilt):
     sem.Delay(delayTilt, "s")
     realTilt = float(sem.ReportTiltAngle())
     if debug:
-        log(f"DEBUG: Stage tilt readback {realTilt} deg (commanded {tilt} deg, deviation {round(realTilt - tilt, 3)} deg)")
+        log(f"DEBUG: Stage tilt readback {round(realTilt, 2)} deg (commanded {round(tilt, 2)} deg, deviation {round(realTilt - tilt, 2)} deg)")
 
     if zeroExpTime > 0 and tilt == startTilt:
         sem.SetExposure("R", zeroExpTime)
@@ -1104,7 +1113,7 @@ def Tilt(tilt):
         log(f"[{pos + 1}] Alignment error: x = {round(aErrX * 1000)} nm | y = {round(aErrY * 1000)} nm")
         if corrASX is not None:                                                                 # per-tilt correction and immediate post-alignment residual (diagnostics for stage vs tracking errors)
             corrX, corrY = is2ssMatrix @ np.array([bufISX + bufISXpre, bufISY + bufISYpre])
-            log(f"[{pos + 1}] Correction: x = {round(corrX, 3)} um | y = {round(corrY, 3)} um | Post-alignment residual: x = {round(corrASX, 0)} nm | y = {round(corrASY, 0)} nm")        
+            log(f"[{pos + 1}] Correction: x = {round(corrX, 2)} um | y = {round(corrY, 2)} um | Post-alignment residual: x = {round(corrASX, 0)} nm | y = {round(corrASY, 0)} nm")        
 
 ### Monitor off-target
         aErrNorm = np.hypot(aErrX, aErrY) * 1000                                                  # residual alignment error with respect to the startTilt reference in nm
@@ -1404,13 +1413,13 @@ if not recover:
             sem.G(-1, -1)                                                                        # measure defocus in the Record low-dose area
             defocus, *_ = sem.ReportAutoFocus()
             neededZ = defocus - eucentricTargetDefocus
-            log(f"Eucentric Z iteration {eucIter + 1}: defocus {defocus} um, correction {neededZ} um")
+            log(f"Eucentric Z iteration {eucIter + 1}: defocus {round(defocus, 2)} um, correction {round(neededZ, 2)} um")
             if abs(neededZ) < fineZTol:                                                      # converged
                 break
             sem.MoveStage(0, 0, -neededZ)                                                        # move Z to null the defocus error
             totalZcorr += neededZ
         sem.UpdateItemZ()
-        log(f"NOTE: Total residual Z correction at the tracking target: {round(totalZcorr, 3)} um")  # small values confirm the lamella was eucentric before the map
+        log(f"NOTE: Total residual Z correction at the tracking target: {round(totalZcorr, 2)} um")  # small values confirm the lamella was eucentric before the map
         sem.RestoreFocus()
         sem.RestoreCameraSet("V")
     else:
@@ -1761,6 +1770,14 @@ if not recover:
         position[-1][0]["n0"] = float(tgt["SSY"])                                               # offset from tilt axis
         position[-1][0]["ISXset"] = float(ISXset)
         position[-1][0]["ISYset"] = float(ISYset)
+
+        if np.linalg.norm(np.array([ISXset - ISX0, ISYset - ISY0], dtype=float)) > imageShiftLimit - alignLimit:   # check the actual image shift after alignment
+            log(f"WARNING: Target [{str(i + 1).zfill(3)}] has an image shift of {round(float(np.linalg.norm(np.array([ISXset - ISX0, ISYset - ISY0]))), 2)} um, too close to the image shift limit ({imageShiftLimit} um). This target will be skipped.")
+            if i == 0:
+                log("WARNING: Continuing with the tracking target despite the large image shift.")
+            else:
+                position[-1][0]["skip"] = True                                                   # plus and minus branch are copies of this position
+                skippedTgts += 1
 
         position[-1].append(copy.deepcopy(position[-1][0]))                                     # plus and minus branch start with same values
         position[-1].append(copy.deepcopy(position[-1][0]))

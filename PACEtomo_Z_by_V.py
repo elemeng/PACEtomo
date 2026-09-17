@@ -3,22 +3,23 @@
 #ScriptName     PACEtomo_Z_by_V
 # Purpose:      Adjusts the stage Z height (fine eucentric Z correction) using the beam-tilt
 #               autofocus defocus measurement, as a standalone Python version of the z_by_v.txt
-#               SerialEM script. Two steps: coarse at the View low-dose area, then a fine step at
-#               the same mag (default) or in the Record low-dose area (if fineMag != 0).
+#               SerialEM script. Two steps: coarse in the View low-dose area using its STORED
+#               parameters (mag, beam, defocus, intensity), then a fine step in the same area
+#               (default) or in the Record low-dose area (if fineMag != 0).
 #               More information at http://github.com/eisfabian/PACEtomo
 # Created:      2026/09/16
 # Revision:     v1.0
-# Last Change:  2026/09/16: initial version
+# Last Change:  2026/09/17: removed the coarseMag setting and the failure-path SkipAcquiringGroup - the coarse step uses the stored parameters of the View low-dose area; on failure the script restores the stage position and ends in the View low-dose area
+#               2026/09/16: initial version
 # ===================================================================
 
 ############ SETTINGS ############ 
 
 errZ_coarse    = 3          # coarse tolerance [um]
 errZ_fine      = 0.5        # fine tolerance [um]
-coarseMag      = 6000       # mag used for the coarse step; set to your low View mag (View area of low dose must be configured to this mag)
-fineMag        = 0          # 0: fine step runs at coarseMag (View area, G -1 2)
-                            # non-zero: fine step runs in the Record area (G -1 -1), using the high mag
-                            # from the low-dose Record configuration - the mag is NOT set here
+fineMag        = 0          # 0 = fine step in the View low-dose area (G -1 2), using the same stored parameters as the coarse step
+                            # 1 (or any non-zero) = fine step in the Record area (G -1 -1), using the high mag
+                            # from the low-dose Record configuration - the mag is NOT set in the script
 beamTilt       = 5         # beam tilt amplitude [% of full scale] used by the autofocus defocus measurement;
                             # applied to the SerialEM user setting 'AutofocusBeamTilt' for the duration of the script.
                             # Larger tilt gives more image shift per um defocus -> quicker and more robust convergence
@@ -50,8 +51,8 @@ def log(text, color=0, style=0):
         style = 1
     elif text.startswith("DEBUG:"):
         color = 1
-    if sem.IsVersionAtLeast("40200", "20240205"):
-        sem.SetNextLogOutputStyle(style, color)
+    #if sem.IsVersionAtLeast("40200", "20240205"):
+        #sem.SetNextLogOutputStyle(style, color)
     sem.EchoBreakLines(text)
 
 def eucentricZStep(errZ, area):
@@ -72,7 +73,7 @@ def eucentricZStep(errZ, area):
             log(f"WARNING: Autofocus image too dark ({meanCounts} counts < {intensity_threshold}). Aborting adjustment!")
             return False
         neededZ = defocus - eucentricTargetDefocus
-        log(f"Iteration {i + 1}: defocus {defocus} um, target {eucentricTargetDefocus} um, correction {neededZ} um")
+        log(f"Iteration {i + 1}: defocus {round(defocus, 2)} um, target {round(eucentricTargetDefocus, 2)} um, correction {round(neededZ, 2)} um")
         if abs(neededZ) < errZ:                                                                  # converged
             return True
         if abs(neededZ) > zLimit:
@@ -87,9 +88,6 @@ def eucentricZStep(errZ, area):
     return False
 
 log("===== Running PACEtomo_Z_byV =====")
-
-# Save current mag so it can be restored in case of failure
-origMag = sem.ReportMag()
 
 # Go to the View low-dose area if low dose is on
 lowDoseReport = sem.ReportLowDose()
@@ -108,10 +106,12 @@ sem.SetUserSetting("AutofocusBeamTilt", beamTilt)
 # sem.SaveFocus() # disabled: Script should end in the View low dose state, do not restore the original focus
 # sem.SetEucentricFocus(1) # If this is on, it seems to be a bug in SerialEM: encentric focus is loop to near zero defocus, but record area is tens of um off. 
 
-# Step 1/2: coarse Z correction at low mag (View area)
+# Step 1/2: coarse Z correction in the View low-dose area, using the STORED parameters of that area
+# (mag, beam, defocus, intensity): the autofocus re-applies the area's settings, so the mag is NOT
+# set in this script. Configure the View low-dose area to the desired coarse magnification.
 converged = True
-sem.SetMag(coarseMag)
-log(f"Step 1/2: coarse Z adjustment at mag {coarseMag}...")
+magView, *_ = sem.ReportMag()
+log(f"Step 1/2: coarse Z adjustment in the View low-dose area (using the stored View parameters, mag {magView}x)...")
 if not eucentricZStep(errZ_coarse, 2):
     converged = False
 
@@ -121,18 +121,16 @@ if converged:
         log("Step 2/2: fine Z adjustment in the Record area...")
         converged = eucentricZStep(errZ_fine, -1)
     else:
-        log(f"Step 2/2: fine Z adjustment at mag {coarseMag} (View area)...")
+        log(f"Step 2/2: fine Z adjustment in the View low-dose area (mag {magView}x)...")
         converged = eucentricZStep(errZ_fine, 2)
 
-# On failure: restore the original stage position and optionally skip the acquiring group
+# On failure: restore the original stage position and leave the scope in the View low-dose area
+# (like the success path); the AutofocusBeamTilt user setting is restored automatically on exit
 if not converged:
     log("ERROR: Failed to adjust eucentric height. Restoring original stage position!")
     sem.MoveStageTo(origX, origY, origZ)
-    if sem.ReportIfNavOpen():
-        if sem.ReportGroupStatus() != -1:
-            sem.SkipAcquiringGroup()
-            log("WARNING: Acquisition of the group was skipped.")
-    sem.SetMag(origMag)                                                                           # SetUserSetting/SaveFocus are restored automatically on exit
+    if lowDoseReport[0] == 1:
+        sem.GoToLowDoseArea("V")                                                                 # end in the View low-dose area, same as the success path
     sem.Exit()
 
 # Leave the scope in the View low-dose area: its mag, defocus offset and intensity are
@@ -140,4 +138,4 @@ if not converged:
 # which may not match the low-dose configuration)
 if lowDoseReport[0] == 1:
     sem.GoToLowDoseArea("V")
-log("===== Finished Z_byV =====")
+log("===== Finished Z_byV =====")
