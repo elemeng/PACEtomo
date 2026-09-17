@@ -7,7 +7,8 @@
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
 # Revision:     v1.9.3
-# Last Change:  2026/09/17: added switchAli (re-anchor tracking target at the first branch switch with View and Preview references), tgtAlignTol (retry + skip for failed target centering at startTilt) and maxAlignError (abort data target branch / warn for tracking target when accumulated alignment error exceeds the limit at any tilt)
+# Last Change:  2026/09/17: made the in-script fine Z correction optional (fineZ setting; when False no Z correction at all, sem.Eucentricity() stays removed) + review refinements (switchAli fixed Preview anchor with View as independent check, streak display, correction/residual log lines, DEBUG tilt readback deviation, residual-Z wording + total Z log)
+#               2026/09/17: added switchAli (re-anchor tracking target at the first branch switch with View and Preview references), tgtAlignTol (retry + skip for failed target centering at startTilt) and maxAlignError (abort data target branch / warn for tracking target when accumulated alignment error exceeds the limit at any tilt)
 #               2026/09/16: added freeStartTilt (first three exposures startTilt, startTilt - step, startTilt + step before the grouped scheme) and swingBreakAngle (large tilt swings split into intermediate moves)
 #               2026/09/16: replaced sem.Eucentricity(1) with fine eucentric Z refinement like Z_byV fineMag=1 (Record-area autofocus defocus); added IS reset loop after target realign
 #               2026/08/27: v1.9.3 release
@@ -59,7 +60,8 @@ measureGeo      = False     # estimates pretilt and rotation values of sample by
 # the Record low-dose area with beam tilt compensation), which is quick, accurate and keeps the
 # targets centred on the positions you defined. A better eucentricity correction also reduces the
 # target-off drift that otherwise builds up at high tilt angles.
-eucentricTol    = 0.5       # convergence tolerance [um] of the fine eucentric Z refinement (like Z_byV with fineMag=1)
+fineZ           = True      # perform the fine residual Z correction at the tracking target before acquisition (defocus measurement in the Record low-dose area plus stage Z movement, like Z_byV fineMag=1); if False, NO Z correction is performed by this script at all (the coarse sem.Eucentricity() routine is permanently removed, the lamella eucentric height must be established before the map, e.g. with the z_by_v script)
+fineZTol    = 0.5       # convergence tolerance [um] of the residual Z correction at the tracking target (fine eucentric Z like Z_byV with fineMag=1; corrects a residual target-local Z offset, it does NOT re-establish the lamella eucentric height)
 eucentricTargetDefocus = 0  # target defocus [um] for the fine eucentric Z refinement (0 = eucentric focus)
 
 # Holey support settings
@@ -660,11 +662,13 @@ def tiltToBreaks(tilt):
 
 def reanchorTrackingAtSwitch(switchTilt, pn):
     """Re-anchor the tracking target at the first branch switch, when all tilt angles are still small:
-    tilt back to the startTilt, align a View image to the View reference saved when the target was
-    added, then tilt to the switch tilt and align again to both the View and the target (Preview)
-    reference. The residuals are checked against tgtAlignTol and the better matching alignment is kept.
-    The resulting image shift is stored in the tracking target's setpoint so that the re-anchoring is
-    applied to the switch image and all following images of this branch."""
+    tilt back to the startTilt and align a View image to the View reference saved when the target was
+    added, then tilt to the switch tilt. At the switch tilt the Preview (target) reference is aligned
+    as the FIXED anchor, while the View reference serves as an independent quality check: both residuals
+    are reported and compared against tgtAlignTol, and a disagreement between the two references is
+    flagged instead of silently choosing one. The resulting image shift is stored in the tracking
+    target's setpoint so that the re-anchoring is applied to the switch image and all following images
+    of this branch."""
     target = targets[0]
     if "viewfile" not in target.keys() and "tgtfile" not in target.keys():
         log("WARNING: switchAli: no View or target reference saved for the tracking target, cannot re-anchor at the first branch switch!")
@@ -676,9 +680,12 @@ def reanchorTrackingAtSwitch(switchTilt, pn):
         sem.V()
         alignTo("O", debug)
         ASX, ASY = sem.ReportAlignShift()[4:6]
+        startErr = np.hypot(ASX, ASY)
         log(f"Switch alignment (View at {startTilt} deg) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
+        if startErr > tgtAlignTol:
+            log(f"WARNING: Tracking target could not be verified at the start tilt ({round(startErr)} nm > {tgtAlignTol} nm tolerance).")
     sem.TiltTo(switchTilt)                                                                      # tilt to the switch tilt
-    # Align again to both references and check against the tolerance
+    # Independent quality check: View reference
     viewErr = np.inf
     if "viewfile" in target.keys():
         sem.ReadOtherFile(0, "O", target["viewfile"])
@@ -687,6 +694,7 @@ def reanchorTrackingAtSwitch(switchTilt, pn):
         ASX, ASY = sem.ReportAlignShift()[4:6]
         viewErr = np.hypot(ASX, ASY)
         log(f"Switch alignment (View at {switchTilt} deg) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
+    # Fixed anchor: Preview (target) reference, aligned last so the final image shift is anchored to it
     prevErr = np.inf
     if "tgtfile" in target.keys():
         sem.ReadOtherFile(0, "O", target["tgtfile"])                                            # reads tgt file for first AlignTo instead
@@ -695,14 +703,24 @@ def reanchorTrackingAtSwitch(switchTilt, pn):
         ASX, ASY = sem.ReportAlignShift()[4:6]
         prevErr = np.hypot(ASX, ASY)
         log(f"Switch alignment (Prev at {switchTilt} deg) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
-    if prevErr > tgtAlignTol and viewErr <= tgtAlignTol:                                        # keep the better matching (View) alignment
+    else:
+        log("NOTE: switchAli: no Preview (target) reference saved for the tracking target, using the View reference as the anchor.")
+    # Use the two references as independent checks, report agreement/disagreement instead of choosing
+    if viewErr < np.inf and prevErr < np.inf:
+        if viewErr <= tgtAlignTol and prevErr <= tgtAlignTol:
+            log(f"NOTE: Switch references agree (View {round(viewErr)} nm, Preview {round(prevErr)} nm, both within the {tgtAlignTol} nm tolerance).")
+        else:
+            log(f"NOTE: Switch references disagree: View error {round(viewErr)} nm vs Preview error {round(prevErr)} nm (tolerance {tgtAlignTol} nm). The Preview reference is the fixed anchor.")
+    if "tgtfile" in target.keys() and prevErr > tgtAlignTol and viewErr <= tgtAlignTol:          # anchor failed but the View is acceptable: explicit fallback
+        log("NOTE: Preview reference exceeded the tolerance while the View reference is acceptable, re-anchoring with the View reference instead.")
         sem.ReadOtherFile(0, "O", target["viewfile"])
         sem.V()
         alignTo("O", debug)
         ASX, ASY = sem.ReportAlignShift()[4:6]
         log(f"Switch alignment (View at {switchTilt} deg, re-aligned) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
         prevErr = np.hypot(ASX, ASY)
-    if min(viewErr, prevErr) > tgtAlignTol:
+    anchorErr = prevErr if "tgtfile" in target.keys() else viewErr
+    if anchorErr > tgtAlignTol:
         log(f"WARNING: Tracking target could not be re-anchored within the tolerance ({tgtAlignTol} nm) at the first branch switch. Continuing with the current alignment.")
     position[0][pn]["ISXset"], position[0][pn]["ISYset"], *_ = sem.ReportImageShift()           # store re-anchored IS so the switch image uses it
 
@@ -828,6 +846,8 @@ def Tilt(tilt):
 
     sem.Delay(delayTilt, "s")
     realTilt = float(sem.ReportTiltAngle())
+    if debug:
+        log(f"DEBUG: Stage tilt readback {realTilt} deg (commanded {tilt} deg, deviation {round(realTilt - tilt, 3)} deg)")
 
     if zeroExpTime > 0 and tilt == startTilt:
         sem.SetExposure("R", zeroExpTime)
@@ -959,6 +979,7 @@ def Tilt(tilt):
 
         bufISXpre = 0                                                                           # only non 0 if two tracking images are taken
         bufISYpre = 0
+        corrASX = corrASY = None                                                            # residual after the alignment of this tilt, only set if an alignment was performed
         if tilt != startTilt or (not tgtPattern and "tgtfile" in targets[pos].keys() and not noZeroRecAli): # align to previous image if it exists 
             if pos != 0: 
                 sem.LimitNextAutoAlign(alignLimit)                                              # gives maximum distance for AlignTo to avoid runaway tracking
@@ -977,6 +998,7 @@ def Tilt(tilt):
                         sem.R()
                     sem.S()
                     alignTo("O", debug)
+            corrASX, corrASY = sem.ReportAlignShift()[4:6]                                      # residual after the last alignment of this tilt (nm), for the log
 
         bufISX, bufISY = sem.ReportISforBufferShift()
 
@@ -1079,16 +1101,19 @@ def Tilt(tilt):
         log(f"[{pos + 1}] Prediction: y = {round(SSYpred, 3)} microns | z = {round(position[pos][pn]['focus'], 3)} microns | z0 = {round(position[pos][pn]['z0'], 3)} microns")
         log(f"[{pos + 1}] Reality: y = {round(position[pos][pn]['SSY'], 3)} microns")
         log(f"[{pos + 1}] Focus change: {round(focuschange, 3)} microns | Focus correction: {round(focuscorrection, 3)} microns")
-        log(f"[{pos + 1}] Alignment error: x = {round(aErrX * 1000)} nm | y = {round(aErrY * 1000)} nm")        
+        log(f"[{pos + 1}] Alignment error: x = {round(aErrX * 1000)} nm | y = {round(aErrY * 1000)} nm")
+        if corrASX is not None:                                                                 # per-tilt correction and immediate post-alignment residual (diagnostics for stage vs tracking errors)
+            corrX, corrY = is2ssMatrix @ np.array([bufISX + bufISXpre, bufISY + bufISYpre])
+            log(f"[{pos + 1}] Correction: x = {round(corrX, 3)} um | y = {round(corrY, 3)} um | Post-alignment residual: x = {round(corrASX, 0)} nm | y = {round(corrASY, 0)} nm")        
 
 ### Monitor off-target
         aErrNorm = np.hypot(aErrX, aErrY) * 1000                                                  # residual alignment error with respect to the startTilt reference in nm
         if aErrNorm > maxAlignError:
             position[pos][pn]["offCount"] += 1
             if pos == 0:                                                                          # tracking target: everything depends on it, only warn
-                log(f"WARNING: Tracking target is off by {round(aErrNorm)} nm at {tilt} deg ({'positive' if pn == 1 else 'negative'} branch), exceeding maxAlignError ({maxAlignError} nm).")
+                log(f"WARNING: Tracking target is off by {round(aErrNorm)} nm at {tilt} deg ({'positive' if pn == 1 else 'negative'} branch), exceeding maxAlignError ({maxAlignError} nm) (streak {position[pos][pn]['offCount']}/3).")
                 if position[pos][pn]["offCount"] >= 3:
-                    log(f"WARNING: Tracking target has been off target for {position[pos][pn]['offCount']} consecutive tilts. Tracking or prediction may be unreliable.")
+                    log(f"WARNING: Persistent tracking deviation: tracking target has been off target for {position[pos][pn]['offCount']} consecutive tilts. Tracking or prediction may be unreliable.")
             else:                                                                                 # data target: stop collecting this branch if it is off target
                 log(f"WARNING: Target [{pos + 1}] is off by {round(aErrNorm)} nm at {tilt} deg ({'positive' if pn == 1 else 'negative'} branch), exceeding maxAlignError ({maxAlignError} nm). This branch will be aborted.")
                 position[pos][pn]["skip"] = True
@@ -1368,22 +1393,28 @@ runFileName = os.path.join(curDir, fileStem + "_run" + str(counter).zfill(2) + "
 if not recover:
     log("Moving to target area...")
 
-    sem.SetCameraArea("V", "F")                                                                 # set View to Full for Eucentricity
     sem.MoveToNavItem(navID)
-    log("Refining eucentricity...")
-    sem.SaveFocus()
-    sem.SetEucentricFocus(1)                                                                     # set standard (eucentric) focus, suppress error if not calibrated
-    for eucIter in range(10):                                                                    # fine eucentric Z like Z_byV with fineMag=1
-        sem.G(-1, -1)                                                                            # measure defocus in the Record low-dose area
-        defocus, *_ = sem.ReportAutoFocus()
-        neededZ = defocus - eucentricTargetDefocus
-        log(f"Eucentric Z iteration {eucIter + 1}: defocus {defocus} um, correction {neededZ} um")
-        if abs(neededZ) < eucentricTol:                                                          # converged
-            break
-        sem.MoveStage(0, 0, -neededZ)                                                            # move Z to null the defocus error
-    sem.UpdateItemZ()
-    sem.RestoreFocus()
-    sem.RestoreCameraSet("V")
+    if fineZ:
+        sem.SetCameraArea("V", "F")                                                             # set View to Full for the fine Z correction (restored below)
+        log("Correcting residual eucentric Z at the tracking target...")                         # residual correction only: the lamella eucentric height should be set before the map (e.g. with z_by_v), this refines the tracking target to it
+        sem.SaveFocus()
+        sem.SetEucentricFocus(1)                                                                 # set standard (eucentric) focus, suppress error if not calibrated
+        totalZcorr = 0                                                                           # accumulate the applied corrections for the final report
+        for eucIter in range(10):                                                                # fine eucentric Z like Z_byV with fineMag=1
+            sem.G(-1, -1)                                                                        # measure defocus in the Record low-dose area
+            defocus, *_ = sem.ReportAutoFocus()
+            neededZ = defocus - eucentricTargetDefocus
+            log(f"Eucentric Z iteration {eucIter + 1}: defocus {defocus} um, correction {neededZ} um")
+            if abs(neededZ) < fineZTol:                                                      # converged
+                break
+            sem.MoveStage(0, 0, -neededZ)                                                        # move Z to null the defocus error
+            totalZcorr += neededZ
+        sem.UpdateItemZ()
+        log(f"NOTE: Total residual Z correction at the tracking target: {round(totalZcorr, 3)} um")  # small values confirm the lamella was eucentric before the map
+        sem.RestoreFocus()
+        sem.RestoreCameraSet("V")
+    else:
+        log("NOTE: Skipping the eucentric Z correction (fineZ = False). The lamella eucentric height has to be set on the map before target selection (e.g. with the z_by_v script).")
 
     log("Realigning to target 1...")
     if alignToP:
