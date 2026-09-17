@@ -7,7 +7,8 @@
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
 # Revision:     v1.9.3
-# Last Change:  2026/09/16: added freeStartTilt (first three exposures startTilt, startTilt - step, startTilt + step before the grouped scheme) and swingBreakAngle (large tilt swings split into intermediate moves)
+# Last Change:  2026/09/17: added switchAli (re-anchor tracking target at the first branch switch with View and Preview references), tgtAlignTol (retry + skip for failed target centering at startTilt) and maxAlignError (abort data target branch / warn for tracking target when accumulated alignment error exceeds the limit at any tilt)
+#               2026/09/16: added freeStartTilt (first three exposures startTilt, startTilt - step, startTilt + step before the grouped scheme) and swingBreakAngle (large tilt swings split into intermediate moves)
 #               2026/09/16: replaced sem.Eucentricity(1) with fine eucentric Z refinement like Z_byV fineMag=1 (Record-area autofocus defocus); added IS reset loop after target realign
 #               2026/08/27: v1.9.3 release
 #               2026/05/13: added check for pixel sizes befor calling AlignBetweenMAgs
@@ -72,6 +73,7 @@ beamTiltComp    = True      # use beam tilt compensation (uses coma vs image shi
 addAF           = False     # does autofocus at the start of every tilt group, increases exposure on tracking TS drastically
 previewAli      = True      # adds initial dose, but makes sure start tilt image is on target (uses view image and aligns to buffer P if alignToP == True)
 viewAli         = False     # adds an alignment step with a View image if it was saved during the target selection (only if previewAli is activated)
+switchAli       = True      # re-anchor the tracking target at the first branch switch (when all tilt angles are still small): tilt back to startTilt, align a View image to the View reference saved during target selection, then tilt to the switch tilt and align again to both the View and the target (Preview) reference, checking the residuals against tgtAlignTol and keeping the better matching alignment; this corrects the image shift drift accumulated on the first branch; adds one View and one Preview image on the tracking area
 
 # Output settings
 sortByTilt      = True      # sorts tilt series by tilt angle after acquisition is completed (takes additional time), requires mrcfile module
@@ -99,6 +101,8 @@ imageShiftLimit = 20        # maximum image shift [microns] SerialEM is allowed 
 dataPoints      = 4         # number of recent specimen shift data points used for estimation of eucentric offset (default: 4)
 alignLimit      = 0.5       # maximum shift [microns] allowed for record tracking between tilts, should reduce loss of target in case of low contrast (not applied for tracking TS); also the threshold to take a second tracking image when using trackTwice
 resetIS_AlignTo_Limit  = 0.5    # maximum residual image shift [microns] allowed at the tracking target after the initial realignment; if exceeded, the image shift is reset (stage move via ResetImageShift) and the target realigned with View until the IS is below this limit, so that the IS of the other targets in the group stays within imageShiftLimit
+tgtAlignTol     = 200       # maximum residual alignment error [nm] allowed when centering a target at startTilt during target setup; if exceeded, the alignment is retried once and if it still fails the target is marked for skipping (for the tracking target only a warning is issued)
+maxAlignError   = 200       # maximum accumulated alignment error [nm] allowed for a target during the tilt series, relative to its startTilt reference; if exceeded for a data target, its branch is aborted to avoid collecting off-target data at high tilts, for the tracking target a warning is issued (large tracking corrections can also indicate that the image shift limit will be reached)
 minCounts       = 0         # minimum mean counts per second of record image (if set > 0, tilt series branch will be aborted if mean counts are not sufficient)
 ignoreNegStart  = True      # ignore first shift on 2nd branch, which is usually very large on bad stages
 realignToItem   = False     # Use SerialEM's RealignToItem routine instead of simple image realignment (was default in PACEtomo <=v1.9.1)
@@ -145,6 +149,11 @@ if not versionCheck and sem.IsVariableDefined("warningVersion") == 0:
         sem.Exit()
     else:
         sem.SetPersistentVar("warningVersion", "")
+
+# Runtime state (not settings, not written to the settings dump)
+prevPn         = None       # tilt series branch (1 = plus, 2 = minus) of the previous tilt image
+prevTilt       = None       # tilt angle of the previous tilt image
+switchAliDone  = False      # the first branch switch re-anchoring was already performed
 
 ########### FUNCTIONS ###########
 
@@ -649,6 +658,54 @@ def tiltToBreaks(tilt):
         sem.TiltTo(cur)
     sem.TiltTo(tilt)
 
+def reanchorTrackingAtSwitch(switchTilt, pn):
+    """Re-anchor the tracking target at the first branch switch, when all tilt angles are still small:
+    tilt back to the startTilt, align a View image to the View reference saved when the target was
+    added, then tilt to the switch tilt and align again to both the View and the target (Preview)
+    reference. The residuals are checked against tgtAlignTol and the better matching alignment is kept.
+    The resulting image shift is stored in the tracking target's setpoint so that the re-anchoring is
+    applied to the switch image and all following images of this branch."""
+    target = targets[0]
+    if "viewfile" not in target.keys() and "tgtfile" not in target.keys():
+        log("WARNING: switchAli: no View or target reference saved for the tracking target, cannot re-anchor at the first branch switch!")
+        return
+    log("Re-anchoring tracking target at the first branch switch...", style=1)
+    sem.TiltTo(startTilt)                                                                       # small move back to the start tilt
+    if "viewfile" in target.keys():
+        sem.ReadOtherFile(0, "O", target["viewfile"])                                           # reads view file for first AlignTo instead
+        sem.V()
+        alignTo("O", debug)
+        ASX, ASY = sem.ReportAlignShift()[4:6]
+        log(f"Switch alignment (View at {startTilt} deg) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
+    sem.TiltTo(switchTilt)                                                                      # tilt to the switch tilt
+    # Align again to both references and check against the tolerance
+    viewErr = np.inf
+    if "viewfile" in target.keys():
+        sem.ReadOtherFile(0, "O", target["viewfile"])
+        sem.V()
+        alignTo("O", debug)
+        ASX, ASY = sem.ReportAlignShift()[4:6]
+        viewErr = np.hypot(ASX, ASY)
+        log(f"Switch alignment (View at {switchTilt} deg) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
+    prevErr = np.inf
+    if "tgtfile" in target.keys():
+        sem.ReadOtherFile(0, "O", target["tgtfile"])                                            # reads tgt file for first AlignTo instead
+        sem.L()
+        alignTo("O", debug)
+        ASX, ASY = sem.ReportAlignShift()[4:6]
+        prevErr = np.hypot(ASX, ASY)
+        log(f"Switch alignment (Prev at {switchTilt} deg) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
+    if prevErr > tgtAlignTol and viewErr <= tgtAlignTol:                                        # keep the better matching (View) alignment
+        sem.ReadOtherFile(0, "O", target["viewfile"])
+        sem.V()
+        alignTo("O", debug)
+        ASX, ASY = sem.ReportAlignShift()[4:6]
+        log(f"Switch alignment (View at {switchTilt} deg, re-aligned) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
+        prevErr = np.hypot(ASX, ASY)
+    if min(viewErr, prevErr) > tgtAlignTol:
+        log(f"WARNING: Tracking target could not be re-anchored within the tolerance ({tgtAlignTol} nm) at the first branch switch. Continuing with the current alignment.")
+    position[0][pn]["ISXset"], position[0][pn]["ISYset"], *_ = sem.ReportImageShift()           # store re-anchored IS so the switch image uses it
+
 def log(text, color=0, style=0):
     if text.startswith("DEBUG:") and not debug:
         return
@@ -731,6 +788,15 @@ def Tilt(tilt):
                 sem.GoToLowDoseArea(ld_area)
 
     global recover
+    global prevPn, prevTilt, switchAliDone
+
+    # First branch switch: re-anchor the tracking target at the start tilt (only once, while all angles are still small)
+    pn = 2 if tilt < startTilt else 1
+    if switchAli and not switchAliDone and tilt != startTilt and prevTilt is not None and prevTilt != startTilt and pn != prevPn and abs(tilt - startTilt) <= step:
+        switchAliDone = True
+        reanchorTrackingAtSwitch(tilt, pn)
+    prevPn = pn
+    prevTilt = tilt
 
     # Tilt if within tilt range, skip branch if not
     if -tiltLimit <= tilt <= tiltLimit:
@@ -1014,6 +1080,20 @@ def Tilt(tilt):
         log(f"[{pos + 1}] Reality: y = {round(position[pos][pn]['SSY'], 3)} microns")
         log(f"[{pos + 1}] Focus change: {round(focuschange, 3)} microns | Focus correction: {round(focuscorrection, 3)} microns")
         log(f"[{pos + 1}] Alignment error: x = {round(aErrX * 1000)} nm | y = {round(aErrY * 1000)} nm")        
+
+### Monitor off-target
+        aErrNorm = np.hypot(aErrX, aErrY) * 1000                                                  # residual alignment error with respect to the startTilt reference in nm
+        if aErrNorm > maxAlignError:
+            position[pos][pn]["offCount"] += 1
+            if pos == 0:                                                                          # tracking target: everything depends on it, only warn
+                log(f"WARNING: Tracking target is off by {round(aErrNorm)} nm at {tilt} deg ({'positive' if pn == 1 else 'negative'} branch), exceeding maxAlignError ({maxAlignError} nm).")
+                if position[pos][pn]["offCount"] >= 3:
+                    log(f"WARNING: Tracking target has been off target for {position[pos][pn]['offCount']} consecutive tilts. Tracking or prediction may be unreliable.")
+            else:                                                                                 # data target: stop collecting this branch if it is off target
+                log(f"WARNING: Target [{pos + 1}] is off by {round(aErrNorm)} nm at {tilt} deg ({'positive' if pn == 1 else 'negative'} branch), exceeding maxAlignError ({maxAlignError} nm). This branch will be aborted.")
+                position[pos][pn]["skip"] = True
+        else:
+            position[pos][pn]["offCount"] = 0        
 
 ### Calculate new z0
 
@@ -1524,7 +1604,7 @@ if not recover:
 ### Target setup
     log(f"Setting up {len(targets)} targets...")
 
-    posTemplate = {"SSX": 0, "SSY": 0, "focus": 0, "z0": 0, "n0": 0, "shifts": [], "angles": [], "ISXset": 0, "ISYset": 0, "ISXali": 0, "ISYali": 0, "dose": 0, "sec": 0, "skip": False}
+    posTemplate = {"SSX": 0, "SSY": 0, "focus": 0, "z0": 0, "n0": 0, "shifts": [], "angles": [], "ISXset": 0, "ISYset": 0, "ISXali": 0, "ISYali": 0, "dose": 0, "sec": 0, "offCount": 0, "skip": False}
     position = []
     skippedTgts = 0
     for i, tgt in enumerate(targets):
@@ -1561,60 +1641,78 @@ if not recover:
 
         sem.ImageShiftByMicrons(float(tgt["SSX"]), float(tgt["SSY"]) * tiltScaling)             # apply relative shifts to find out absolute IS after realign to item
         if (previewAli or viewAli):                                                             # adds initial dose, but makes sure start tilt image is on target
-            if alignToP:
-                x, y, binning, exp, *_ = sem.ImageProperties("P")
-                sem.SetExposure("V", exp)
-                sem.SetBinning("V", int(binning))
-                sem.V()
-                sem.CropCenterToSize("A", int(x), int(y))
-                alignTo("P", debug)
-                sem.RestoreCameraSet("V")
-            else:
-                if "viewfile" in tgt.keys() and viewAli and i != 0:                             # skip for tracking target since it was already aligned after tilt to startTilt   
-                    sem.ReadOtherFile(0, "O", tgt["viewfile"])                                  # reads view file for first AlignTo instead
+            for tgtAlignTry in range(2):                                                        # retry the alignment once if the residual error exceeds the tolerance
+                ASX = ASY = 0                                                                   # no alignment performed, nothing to check
+                if tgtAlignTry > 0:                                                             # reset image shift and re-apply the target shift for a clean second attempt
+                    sem.SetImageShift(ISX0, ISY0)
+                    sem.ImageShiftByMicrons(float(tgt["SSX"]), float(tgt["SSY"]) * tiltScaling)
+                if alignToP:
+                    x, y, binning, exp, *_ = sem.ImageProperties("P")
+                    sem.SetExposure("V", exp)
+                    sem.SetBinning("V", int(binning))
                     sem.V()
-                    alignTo("O", debug)
+                    sem.CropCenterToSize("A", int(x), int(y))
+                    alignTo("P", debug)
                     ASX, ASY = sem.ReportAlignShift()[4:6]
-                    log(f"Target alignment (View) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")    
-                if "tgtfile" in tgt.keys() and previewAli and tgt["LDArea"] == "R":                
-                    sem.ReadOtherFile(0, "O", tgt["tgtfile"])                                   # reads tgt file for first AlignTo instead
-                    sem.L()
-                    alignTo("O", debug)
-                    AISX, AISY, ASX, ASY = sem.ReportAlignShift()[2:6]
-                    log(f"Target alignment (Prev) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
-                elif "viewfile" in tgt.keys() and previewAli and tgt["LDArea"] != "V":
-                    # Use align between mags to align preview image to view image
-                    if not viewAli:
-                        #sem.GoToLowDoseArea("V")                                               # If ReadOtherFile while in Record, pixel size of Record is used and AlignBetweenMags fails (seems to be fixed in 4.2beta from 14.08.2024)
+                    sem.RestoreCameraSet("V")
+                    log(f"Target alignment (P) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
+                else:
+                    if "viewfile" in tgt.keys() and viewAli and i != 0:                         # skip for tracking target since it was already aligned after tilt to startTilt   
                         sem.ReadOtherFile(0, "O", tgt["viewfile"])                              # reads view file for first AlignTo instead
-                    else:
-                        # If View image was already aligned, take new centered View image at startTilt and use as reference instead
                         sem.V()
-                        sem.Copy("A", "O")
-                    
-                    # Check defocus offset
-                    if tgt["LDArea"] == "R":
-                        sem.GoToLowDoseArea("R")                                                # Switch to R before applying defocus offset to not mess with potential mP/nP offsets between View and Rec
+                        alignTo("O", debug)
+                        ASX, ASY = sem.ReportAlignShift()[4:6]
+                        log(f"Target alignment (View) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")    
+                    if "tgtfile" in tgt.keys() and previewAli and tgt["LDArea"] == "R":                
+                        sem.ReadOtherFile(0, "O", tgt["tgtfile"])                               # reads tgt file for first AlignTo instead
+                        sem.L()
+                        alignTo("O", debug)
+                        AISX, AISY, ASX, ASY = sem.ReportAlignShift()[2:6]
+                        log(f"Target alignment (Prev) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")
+                    elif "viewfile" in tgt.keys() and previewAli and tgt["LDArea"] != "V":
+                        # Use align between mags to align preview image to view image
+                        if not viewAli:
+                            #sem.GoToLowDoseArea("V")                                           # If ReadOtherFile while in Record, pixel size of Record is used and AlignBetweenMags fails (seems to be fixed in 4.2beta from 14.08.2024)
+                            sem.ReadOtherFile(0, "O", tgt["viewfile"])                          # reads view file for first AlignTo instead
+                        else:
+                            # If View image was already aligned, take new centered View image at startTilt and use as reference instead
+                            sem.V()
+                            sem.Copy("A", "O")
+                        
+                        # Check defocus offset
+                        if tgt["LDArea"] == "R":
+                            sem.GoToLowDoseArea("R")                                            # Switch to R before applying defocus offset to not mess with potential mP/nP offsets between View and Rec
+                            defocus_offset = max(-10, sem.ReportLDDefocusOffset("V"))
+                            if defocus_offset != 0:
+                                sem.ChangeFocus(defocus_offset)                                 # Higher defocus for better correlation, but max at 10 to avoid major distortions
+                            sem.L()
+                        elif tgt["LDArea"] == "S":
+                            sem.Search()
+                        sem.AlignBetweenMags("O", -1, -1, -1)
+                        AISX, AISY, ASX, ASY = sem.ReportAlignShift()[2:6]
                         defocus_offset = max(-10, sem.ReportLDDefocusOffset("V"))
                         if defocus_offset != 0:
-                            sem.ChangeFocus(defocus_offset)                                     # Higher defocus for better correlation, but max at 10 to avoid major distortions
-                        sem.L()
-                    elif tgt["LDArea"] == "S":
-                        sem.Search()
-                    sem.AlignBetweenMags("O", -1, -1, -1)
-                    AISX, AISY, ASX, ASY = sem.ReportAlignShift()[2:6]
-                    defocus_offset = max(-10, sem.ReportLDDefocusOffset("V"))
-                    if defocus_offset != 0:
-                        sem.ChangeFocus(-defocus_offset)                                        # Reset focus
-                    log(f"Target alignment (Pv2V) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")           
+                            sem.ChangeFocus(-defocus_offset)                                    # Reset focus
+                        log(f"Target alignment (Pv2V) error in X | Y: {round(ASX, 0)} nm | {round(ASY, 0)} nm")           
 
-                # Save preview image as new reference
-                if refFromPreview:
-                    sem.OpenNewFile(os.path.splitext(tgt["tgtfile"])[0] + "_tempref.mrc")
-                    sem.S()
-                    sem.CloseFile()
-                    position[-1][0]["ISXali"] = AISX                                            # Save shifts to real reference
-                    position[-1][0]["ISYali"] = AISY 
+                    # Save preview image as new reference
+                    if refFromPreview:
+                        sem.OpenNewFile(os.path.splitext(tgt["tgtfile"])[0] + "_tempref.mrc")
+                        sem.S()
+                        sem.CloseFile()
+                        position[-1][0]["ISXali"] = AISX                                        # Save shifts to real reference
+                        position[-1][0]["ISYali"] = AISY 
+
+                if np.hypot(ASX, ASY) <= tgtAlignTol:                                            # residual alignment error is within tolerance
+                    break
+                log(f"WARNING: Target alignment error ({round(float(np.hypot(ASX, ASY)))} nm) exceeds tolerance ({tgtAlignTol} nm). Retrying alignment...")
+            else:                                                                               # target could not be centered within tolerance
+                log(f"WARNING: Target [{str(i + 1).zfill(3)}] could not be centered at startTilt within tolerance ({tgtAlignTol} nm) after 2 attempts.")
+                if i == 0:
+                    log("WARNING: Continuing with the tracking target despite the large alignment error.")
+                else:
+                    log("WARNING: This target will be skipped.")
+                    position[-1][0]["skip"] = True                                              # plus and minus branch are copies of this position
 
             sem.GoToLowDoseArea(tgt["LDArea"])
         ISXset, ISYset, *_ = sem.ReportImageShift()
@@ -1745,6 +1843,7 @@ else:
             position[-1][i+1]["ISYset"] = float(savedRun[pos][i]["ISYset"])
             position[-1][i+1]["ISXali"] = float(savedRun[pos][i]["ISXali"])
             position[-1][i+1]["ISYali"] = float(savedRun[pos][i]["ISYali"])
+            position[-1][i+1]["offCount"] = 0
             position[-1][i+1]["dose"] = float(savedRun[pos][i]["dose"])
             position[-1][i+1]["sec"] = int(savedRun[pos][i]["sec"])
             position[-1][i+1]["skip"] = True if savedRun[pos][i]["skip"] == "True" or targets[pos]["skip"] == "True" else False
