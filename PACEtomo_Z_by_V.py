@@ -9,7 +9,7 @@
 #               More information at http://github.com/eisfabian/PACEtomo
 # Created:      2026/09/16
 # Revision:     v1.0
-# Last Change:  2026/09/17: removed the coarseMag setting and the failure-path SkipAcquiringGroup - the coarse step uses the stored parameters of the View low-dose area; on failure the script restores the stage position and ends in the View low-dose area
+# Last Change:  2026/09/17: reverted the frame-saving toggle (SetDoseFracParams, temporarily suspected in a UI stall), failure path restores stage position and ends in the View low-dose area, removed coarseMag; the coarse step uses the stored parameters of the View low-dose area
 #               2026/09/16: initial version
 # ===================================================================
 

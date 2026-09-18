@@ -7,7 +7,7 @@
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
 # Revision:     v1.9.3
-# Last Change:  2026/09/17: review fixes — switchAli re-anchor correction propagated to all targets; targets whose measured image shift exceeds imageShiftLimit minus alignLimit are skipped during target setup (tracking target warns); plus fineZ option and review refinements (switchAli fixed Preview anchor with View as independent check, streak display, correction/residual log lines, DEBUG tilt readback deviation)
+# Last Change:  2026/09/17: reverted the fineZ frame-saving toggle (SetDoseFracParams temporarily suspected in a UI stall at the first post-tilt Record acquisition; back to upstream behavior) and fixed the resetIS helper name collision (renamed to resetISAlignToLimit)
 #               2026/09/17: added switchAli (re-anchor tracking target at the first branch switch with View and Preview references), tgtAlignTol (retry + skip for failed target centering at startTilt) and maxAlignError (abort data target branch / warn for tracking target when accumulated alignment error exceeds the limit at any tilt)
 #               2026/09/16: added freeStartTilt (first three exposures startTilt, startTilt - step, startTilt + step before the grouped scheme) and swingBreakAngle (large tilt swings split into intermediate moves)
 #               2026/09/16: replaced sem.Eucentricity(1) with fine eucentric Z refinement like Z_byV fineMag=1 (Record-area autofocus defocus); added IS reset loop after target realign
@@ -618,14 +618,15 @@ def realignTo(nav_id=None, target=None):
     else:
         log(f"WARNING: No target provided for realignment!")
 
-def resetIS_AlignTo_Limit(target):
+def resetISAlignToLimit(target):
     """Reduce the residual image shift at the tracking target to below resetIS_AlignTo_Limit so the
     image shifts of the other targets in the group stay within imageShiftLimit. Called once per
     exposure group (tracking position), after realignment. ResetImageShift moves the stage to
     compensate the IS; the target is then realigned with View and the IS re-checked, repeating
     until it is below the limit. If the limit cannot be reached within the maximum number of
     attempts, the IS needed for alignment is kept and the acquisition continues anyway, so that
-    at least targets close to the tracking position can be collected at the defined positions."""
+    at least targets close to the tracking position can be collected at the defined positions.
+    (Named with no underscores around to not shadow the resetIS_AlignTo_Limit setting.)"""
 
     sem.GoToLowDoseArea("R")
     for isIter in range(10):
@@ -1414,7 +1415,7 @@ if not recover:
             defocus, *_ = sem.ReportAutoFocus()
             neededZ = defocus - eucentricTargetDefocus
             log(f"Eucentric Z iteration {eucIter + 1}: defocus {round(defocus, 2)} um, correction {round(neededZ, 2)} um")
-            if abs(neededZ) < fineZTol:                                                      # converged
+            if abs(neededZ) < fineZTol:                                                          # converged
                 break
             sem.MoveStage(0, 0, -neededZ)                                                        # move Z to null the defocus error
             totalZcorr += neededZ
@@ -1494,7 +1495,7 @@ if not recover:
         #sem.RealignToOtherItem(navID, 1) # <= sometimes unreliable
         realignTo(nav_id=navID, target=targets[0])
 
-    resetIS_AlignTo_Limit(targets[0])                                                           # zero residual IS at the tracking target (once per exposure group)
+    resetISAlignToLimit(targets[0])                                                              # zero residual IS at the tracking target (once per exposure group)
 
     if measureGeo:
         log("Measuring geometry...")
@@ -1583,6 +1584,8 @@ if not recover:
         branchsteps = max(maxTilt - startTilt, abs(minTilt - startTilt)) / groupSize / step
 
     log("Tilting to start tilt angle...")
+    curX, curY, curZ = sem.ReportStageXYZ()                                                        # diagnostic: stage state when entering the tilt section (reported before any motion/acquisition)
+    log(f"Stage position on entering tilt section: X = {round(curX, 2)} | Y = {round(curY, 2)} | Z = {round(curZ, 2)} | tilt = {round(float(sem.ReportTiltAngle()), 2)}")
     # backlash correction
     sem.V()
     sem.Copy("A", "O")
@@ -1591,7 +1594,7 @@ if not recover:
 
     # Walk up if necessary
     while abs(startTilt - curTilt) > 10:
-        log(f"DEBUG: Doing walkup to {curTilt + (10 if startTilt > 0 else -10)}...")
+        log(f"Walk-up: tilting from {curTilt} to {curTilt + (10 if startTilt > 0 else -10)} deg...")  # always logged so a stuck stage is visible
         sem.TiltTo(curTilt + (10 if startTilt > 0 else -10))
         sem.V()
         alignTo("O", debug)
@@ -1599,6 +1602,7 @@ if not recover:
         sem.Copy("A", "O")
         curTilt = int(round(float(sem.ReportTiltAngle())))
 
+    log(f"Walking to start tilt: {startTilt - step} deg, then {startTilt} deg...")                   # always logged before the final tilt approach
     sem.TiltTo(startTilt - step)
     sem.TiltTo(startTilt)
 
@@ -1607,15 +1611,21 @@ if not recover:
     sem.GoToLowDoseArea("R")
 
     if not tgtPattern and previewAli:
+        log("Tilt section: loading the tracking map into buffer O...")
         sem.LoadOtherMap(navID, "O")                                                            # preview ali before first tilt image is taken
+        log("Tilt section: acquiring an image to match the tracking map...")
         sem.AcquireToMatchBuffer("O")                                                           # in case view image was saved for tracking target
+        log("Tilt section: aligning to the tracking map...")
         alignTo("O", debug)
 
+    log("Tilt section: reporting image shift and specimen shift...")
     ISX0, ISY0, *_ = sem.ReportImageShift()
     SSX0, SSY0 = sem.ReportSpecimenShift()
 
+    log("Tilt section: running full autofocus (focus to target)...")
     sem.G()
     focus0 = float(sem.ReportDefocus())
+    log(f"Tilt section: autofocus done, focus0 = {round(focus0, 2)} um")
     positionFocus = focus0                                                                      # set maxDefocus as focus0 and add focus steps in loop
     minFocus0 = focus0 - maxDefocus + minDefocus
 
@@ -1868,7 +1878,7 @@ else:
             sem.RestoreCameraSet("V")
         else:
             sem.RealignToOtherItem(navID, 1)
-        resetIS_AlignTo_Limit(targets[0])                                                     # zero residual IS at the tracking target (once per exposure group)
+        resetISAlignToLimit(targets[0])                                                     # zero residual IS at the tracking target (once per exposure group)
     position = []
     skippedTgts = 0
     for pos in range(len(targets)):
