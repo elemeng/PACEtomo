@@ -7,7 +7,7 @@
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
 # Revision:     v1.9.3
-# Last Change:  2026/09/17: reverted the fineZ frame-saving toggle (SetDoseFracParams temporarily suspected in a UI stall at the first post-tilt Record acquisition; back to upstream behavior) and fixed the resetIS helper name collision (renamed to resetISAlignToLimit)
+# Last Change:  2026/09/17: fixed fresh-run NameError on the freeStartTilt exposures (resumePN/resumePlus/resumeMinus/posResumed are now initialized before the first Tilt call); reverted the fineZ frame-saving toggle; fixed resetIS helper name collision; tilt-section trace logging
 #               2026/09/17: added switchAli (re-anchor tracking target at the first branch switch with View and Preview references), tgtAlignTol (retry + skip for failed target centering at startTilt) and maxAlignError (abort data target branch / warn for tracking target when accumulated alignment error exceeds the limit at any tilt)
 #               2026/09/16: added freeStartTilt (first three exposures startTilt, startTilt - step, startTilt + step before the grouped scheme) and swingBreakAngle (large tilt swings split into intermediate moves)
 #               2026/09/16: replaced sem.Eucentricity(1) with fine eucentric Z refinement like Z_byV fineMag=1 (Record-area autofocus defocus); added IS reset loop after target realign
@@ -1811,6 +1811,9 @@ if not recover:
 
     geo = [[], [], []]
 
+    posResumed = -1                                                                             # defaults for the shift-ignore conditions in Tilt() before any image is taken
+    resumePN = 0
+    resumePlus = resumeMinus = startTilt
     plustilt = minustilt = startTilt
     tiltStepCounter = 1
     Tilt(startTilt)

@@ -4,7 +4,11 @@
 # Author:       Fabian Eisenstein
 # Created:      2022/12/09
 # Revision:     v1.9
-# Last Change:  2026/01/31: added onlyView mode to skip generation of Preview maps
+# Last Change:  2026/09/18: virtual maps are cropped to EXACTLY the dimensions and pixel size of the real low-dose View and
+#               Record template images (previously the template pixel size was divided by the binning again and the crop was
+#               sized from the camera properties, so the maps had a wrong scale and did not match live images; e.g. K3 bin 8
+#               gave 720x511 at the wrong pixel size vs 720x508 live, which made SerialEM's alignment/map matching fail or stall)
+#               2026/01/31: added onlyView mode to skip generation of Preview maps
 #               2024/05/14: added warning for items not on map, added proper check for camera type
 
 # Take a montage of your target area. 
@@ -217,24 +221,27 @@ if (prevID == 0 and not onlyView) or viewID == 0:
         sem.Echo("If you have a View and Preview image in the Navigator that you want to use as template, please change the Navigator Note to 'Template View' and 'Template Preview', respectively.")
         sem.Exit()
 
-# Load templates to get pixel sizes
+# Load templates: the virtual maps are cropped to EXACTLY the dimensions and pixel size of the real
+# low-dose View and Record images saved as templates, so that they are indistinguishable from a live
+# acquisition for SerialEM's alignment and map matching.
 
 sem.LoadOtherMap(viewID, "A")
 imgProp = sem.ImageProperties("A")
-viewPixSize = imgProp[4] * 10 / imgProp[2]
+viewPixSize = imgProp[4] * 10                                                           # pixel size as stored (do NOT divide by binning)
+viewSizeX, viewSizeY = imgProp[0], imgProp[1]                                           # exact template image dimensions
+viewBinning = imgProp[2]                                                                # binning of the template image
 
 if not onlyView:
     sem.LoadOtherMap(prevID, "A")
     imgProp = sem.ImageProperties("A")
-    recordPixSize = imgProp[4] * 10 / imgProp[2]
+    recordPixSize = imgProp[4] * 10
+    recordSizeX, recordSizeY = imgProp[0], imgProp[1]
+    recordBinning = imgProp[2]
 
     if recordPixSize == viewPixSize:
         sem.OKBox("ERROR: Template for View or Preview show the same pixel size! Make sure the maps could be loaded properly!")
         sem.Echo("ERROR: Template for View or Preview show the same pixel size! Make sure the maps could be loaded properly!")
         sem.Exit()
-
-camX = imgProp[0] * imgProp[2]
-camY = imgProp[1] * imgProp[2]
 
 if sem.ReportCameraProperty(0, "K2Type") > 0:
     binFactor = 2           # gatan cameras need the extra binning factor because SR is bin 1 
@@ -272,35 +279,17 @@ groupImageX = np.array(sem.GetVariable("groupImageX").split(), dtype=float)
 groupImageY = np.array(sem.GetVariable("groupImageY").split(), dtype=float)
 
 # Calculate field of view
+# The virtual maps get EXACTLY the dimensions and pixel size of the template images: the montage is cropped
+# over the area that one template image covers and resized to the template's pixel dimensions.
 
 if not onlyView:
-    fov_recX = int(camX * recordPixSize / pixSize)
-    fov_recY = int(camY * recordPixSize / pixSize)
+    fov_recX = int(recordSizeX * recordPixSize / pixSize)
+    fov_recY = int(recordSizeY * recordPixSize / pixSize)
+    out_recX, out_recY = recordSizeX, recordSizeY
 
-    out_bin_rec = min(8, int(pixSize / recordPixSize))  # binning factor of the created virtual map for Record mode (needs to be int)
-    if out_bin_rec < 8:
-        if out_bin_rec < 4:
-            if out_bin_rec > 1:
-                out_bin_rec = 2
-        else:
-            out_bin_rec = 4
-
-    out_recX = int(camX / out_bin_rec)
-    out_recY = int(camY / out_bin_rec)
-
-fov_viewX = int(camX * viewPixSize / pixSize)
-fov_viewY = int(camY * viewPixSize / pixSize)
-
-out_bin_view = min(8, int(pixSize / viewPixSize))   # binning factor of the created virtual map for View mode (needs to be int)
-if out_bin_view < 8:
-    if out_bin_view < 4:
-        if out_bin_view > 1:
-            out_bin_view = 2
-    else:
-        out_bin_view = 4
-
-out_viewX = int(camX / out_bin_view)
-out_viewY = int(camY / out_bin_view)
+fov_viewX = int(viewSizeX * viewPixSize / pixSize)
+fov_viewY = int(viewSizeY * viewPixSize / pixSize)
+out_viewX, out_viewY = viewSizeX, viewSizeY
 
 # Crop out virt maps
 
@@ -313,11 +302,11 @@ for i in range(groupStageX.size):
         imageCrop = CropImage(image, (groupImageY[i], groupImageX[i]), (fov_recY, fov_recX))
         imageProc = np.flip(resize(imageCrop, (out_recY, out_recX), preserve_range=True, anti_aliasing=True).astype(np.float32), axis=0)
         tgtImages.append(imageProc)
-        WriteMrc(userName + "_tgt_" + str(i + 1).zfill(3) + ".mrc", tgtImages[i], recordPixSize * out_bin_rec)
+        WriteMrc(userName + "_tgt_" + str(i + 1).zfill(3) + ".mrc", tgtImages[i], recordPixSize)
 
     imageCrop = CropImage(image, (groupImageY[i], groupImageX[i]), (fov_viewY, fov_viewX))
     viewImageProc = np.flip(resize(imageCrop, (out_viewY, out_viewX), preserve_range=True, anti_aliasing=True).astype(np.float32), axis=0)
-    WriteMrc(userName + "_tgt_" + str(i + 1).zfill(3) + "_view.mrc", viewImageProc, viewPixSize * out_bin_view)
+    WriteMrc(userName + "_tgt_" + str(i + 1).zfill(3) + "_view.mrc", viewImageProc, viewPixSize)
 
     if not dummy:
         SSX, SSY = s2ssMatrix @ np.array([groupStageX[i] - groupStageX[0], groupStageY[i] - groupStageY[0]])
@@ -376,7 +365,7 @@ for i, tgt in enumerate(targets):
     viewItem["PtsY"] = ptsDY_view + tgt["stageY"]
     viewItem["MapFile"] = [os.path.join(curDir, tgt["viewfile"])]
     viewItem["Note"] = [tgt["viewfile"]]
-    viewItem["MapBinning"] = [out_bin_view * binFactor]
+    viewItem["MapBinning"] = [viewBinning * binFactor]
     viewItem["MapMinMaxScale"] = [np.min(viewImageProc), np.max(viewImageProc)]
 
     # Create new map ID
@@ -399,7 +388,7 @@ for i, tgt in enumerate(targets):
         tgtItem["PtsX"] = ptsDX_rec + tgt["stageX"]
         tgtItem["PtsY"] = ptsDY_rec + tgt["stageY"]
         tgtItem["MapFile"] = [os.path.join(curDir, tgt["tgtfile"])]
-        tgtItem["MapBinning"] = [out_bin_rec * binFactor]
+        tgtItem["MapBinning"] = [recordBinning * binFactor]
         tgtItem["MapMinMaxScale"] = [np.min(tgtImages[i]), np.max(tgtImages[i])]
 
         # Create new map ID
