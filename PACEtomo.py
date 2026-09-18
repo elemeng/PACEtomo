@@ -43,7 +43,7 @@ zeroDefocus	    = 0 		# set to defocus [microns] used for start tilt image, if 0
 trackExpTime    = 0         # set to exposure time [s] used for tracking tilt series, if 0: use same exposure time for all tilt series
 trackDefocus    = 0         # set to defocus [microns] used for tracking tilt series, if 0: use same defocus range for all tilt series
 trackMag        = 0         # set to nominal magnification for tracking tilt series (make sure detector is still covered under the same beam conditions), if 0: use same mag for all tilt series
-trackTwice      = False     # track in 2 steps, useful when large tracking shifts cause inaccuracies in alignment and hence, in residual errors for all targets, but causes double exposure of tracking area
+trackTwice      = True     # track in 2 steps, useful when large tracking shifts cause inaccuracies in alignment and hence, in residual errors for all targets, but causes double exposure of tracking area
 trackUseTrial   = False     # Use Trial Low Dose Area for the tracking tilt series (not recommended unless you need to change the illuminated area)
 
 # Geometry settings
@@ -72,27 +72,27 @@ refineGeo       = False     # uses on-the-fly CtfFind results of first image to 
 
 # Session settings
 beamTiltComp    = True      # use beam tilt compensation (uses coma vs image shift calibrations)
-addAF           = False     # does autofocus at the start of every tilt group, increases exposure on tracking TS drastically
+addAF           = True     # does autofocus at the start of every tilt group, increases exposure on tracking TS drastically
 previewAli      = True      # adds initial dose, but makes sure start tilt image is on target (uses view image and aligns to buffer P if alignToP == True)
-viewAli         = False     # adds an alignment step with a View image if it was saved during the target selection (only if previewAli is activated)
+viewAli         = True     # adds an alignment step with a View image if it was saved during the target selection (only if previewAli is activated)
 switchAli       = True      # re-anchor the tracking target at the first branch switch (when all tilt angles are still small): tilt back to startTilt, align a View image to the View reference saved during target selection, then tilt to the switch tilt and align again to both the View and the target (Preview) reference, checking the residuals against tgtAlignTol and keeping the better matching alignment; this corrects the image shift drift accumulated on the first branch; adds one View and one Preview image on the tracking area
 
 # Output settings
 sortByTilt      = True      # sorts tilt series by tilt angle after acquisition is completed (takes additional time), requires mrcfile module
 binFinalStack   = 1         # bin factor for final saved stack after acquisition (unbinned stack will be deleted to save storage space)
 delFinalStack   = False     # delete final tilt series stacks (only keeps frames for reconstruction to save storage space) 
-doCtfFind       = False     # set to False to skip CTFfind estimation (only necessary if it causes crashes => if it does crash, SerialEM will output some troubleshoot data that you should send to David!) 
+doCtfFind       = True     # set to False to skip CTFfind estimation (only necessary if it causes crashes => if it does crash, SerialEM will output some troubleshoot data that you should send to David!) 
 doCtfPlotter    = True      # runs ctfplotter instead of CTFfind, needs standalone version of 3dmod on PATH
 extendedMdoc    = True      # saves additional info to .mdoc file
 
 # Hardware settings
-slowTilt        = False     # do backlash step for all tilt angles, on bad stages large tilt steps are less accurate
-swingBreakAngle = 30        # maximum stage tilt movement [degrees] in one swing between exposures; larger swings are split into intermediate moves (no images taken in between) to reduce off-target caused by large tilt moves, 0 disables splitting
+slowTilt        = True     # do backlash step for all tilt angles, on bad stages large tilt steps are less accurate
+swingBreakAngle = 45        # maximum stage tilt movement [degrees] in one swing between exposures; larger swings are split into intermediate moves (no images taken in between) to reduce off-target caused by large tilt moves, 0 disables splitting
 taOffsetPos     = 0         # additional tilt axis offset values [microns] applied to calculations for positive and...
 taOffsetNeg     = 0         # ...negative branch of the tilt series (possibly useful for side-entry holder systems)
 checkDewar      = True      # check if dewars are refilling before every acquisition
-cryoARM         = False     # if you use a JEOL cryoARM TEM, this will keep the dewar refilling in sync
-coldFEG         = False     # if you use a cold FEG, this will flash the gun whenever the dewars are being refilled
+cryoARM         = True     # if you use a JEOL cryoARM TEM, this will keep the dewar refilling in sync
+coldFEG         = True     # if you use a cold FEG, this will flash the gun whenever the dewars are being refilled
 flashInterval   = -1        # time in hours between cold FEG flashes, -1: flash only during dewar refill (interval is ignored on Krios, uses FlashingAdvised function instead)
 slitInterval    = 0         # time in minutes between centering the energy filter slit using RefineZLP, ONLY works with tgtPattern (needs pattern vectors to find good position for alignment)
 
@@ -102,11 +102,11 @@ parabolTh       = 9         # refineGeo: minimum number of passable CtfFind valu
 imageShiftLimit = 20        # maximum image shift [microns] SerialEM is allowed to apply (this is a SerialEM property entry, default is 15 microns)
 dataPoints      = 4         # number of recent specimen shift data points used for estimation of eucentric offset (default: 4)
 alignLimit      = 0.5       # maximum shift [microns] allowed for record tracking between tilts, should reduce loss of target in case of low contrast (not applied for tracking TS); also the threshold to take a second tracking image when using trackTwice
-resetIS_AlignTo_Limit  = 0.5    # maximum residual image shift [microns] allowed at the tracking target after the initial realignment; if exceeded, the image shift is reset (stage move via ResetImageShift) and the target realigned with View until the IS is below this limit, so that the IS of the other targets in the group stays within imageShiftLimit
+resetIS_AlignTo_Limit  = 1    # maximum residual image shift [microns] allowed at the tracking target after the initial realignment; if exceeded, the image shift is reset (stage move via ResetImageShift) and the target realigned with View until the IS is below this limit, so that the IS of the other targets in the group stays within imageShiftLimit
 tgtAlignTol     = 200       # maximum residual alignment error [nm] allowed when centering a target at startTilt during target setup; if exceeded, the alignment is retried once and if it still fails the target is marked for skipping (for the tracking target only a warning is issued)
 maxAlignError   = 200       # maximum accumulated alignment error [nm] allowed for a target during the tilt series, relative to its startTilt reference; if exceeded for a data target, its branch is aborted to avoid collecting off-target data at high tilts, for the tracking target a warning is issued (large tracking corrections can also indicate that the image shift limit will be reached)
 minCounts       = 0         # minimum mean counts per second of record image (if set > 0, tilt series branch will be aborted if mean counts are not sufficient)
-ignoreNegStart  = True      # ignore first shift on 2nd branch, which is usually very large on bad stages
+ignoreNegStart  = False      # ignore first shift on 2nd branch, which is usually very large on bad stages
 realignToItem   = False     # Use SerialEM's RealignToItem routine instead of simple image realignment (was default in PACEtomo <=v1.9.1)
 refFromPreview  = False     # Makes temporary reference from Preview image collected during previewAli for use with first Record image
 noZeroRecAli    = False     # Skip alignment of first tilt image to reference 
