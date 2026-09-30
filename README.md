@@ -375,6 +375,12 @@ This is an eucentric Z correction script. It adjusts the stage Z to the eucentri
   - The `beamTilt` setting (% of full scale on JEOL, milliradians on Thermo/FEI) controls the beam tilt amplitude used for the measurement. On the JEOL cryoARM, 5-10% converges much faster and more robustly than 0.5% (keep ≤10% for linearity).
   - Run the script, wait for the "Finished Z_byV" message, and optionally run it again to check for a remaining offset (as recommended for `PACEtomo_measureOffset.py`).
 
+#### [*PACEtomo_measureBeam.py*](PACEtomo_measureBeam.py)
+This is a test script for beam centering (it is not used during acquisition). Over a long session the beam slowly drifts relative to the camera and the optical axis, which makes the illumination asymmetric and can leave image-shifted targets under-illuminated. This script lets you evaluate SerialEM's centering routines on the microscope before deciding whether (and how often) the acquisition should do it:
+- `mode = "monitor"`: only logs the beam shift every `monitorInterval` minutes for `monitorMinutes` minutes (no images, no beam movement) and reports the drift in µm/h — run this first to see how fast the beam drifts on your setup.
+- `mode = "test"`: reports the beam shift and then runs the selected centering routine `iterations` times, logging how far the beam moved, how long it took and whether it converged (a second run should move almost nothing). `method` selects `AutoCenterBeam` (default; finds the beam itself and also works when the beam is larger than the camera) or `CenterBeamFromImage` on a fresh View image, using either the beam edges (`"edges"`) or the intensity centroid (`"centroid"`, requires the beam to fit into the camera field). The status code of the image-based routine is decoded in the log ("moved", "no beam edges detected", "radius too high", ...).
+- Safety: both routines get `maxShift` [µm] as the limit above which they leave the beam alone; the script switches to the View low dose area (optionally setting the View camera area to Full) and restores the state afterwards; `restoreShift = True` undoes the centering; the beam diameter (`MeasureBeamSize`) is logged for the image-based methods.
+
 ## Video Tutorials
 A selection of video tutorials was uploaded to Youtube. These were recorded using older versions of PACEtomo and some features and settings might be missing. The general workflows, however, remain the same.
 
@@ -407,6 +413,9 @@ Fully automatic runs: run the scripts from disk instead of pasting them.
 - Local tooling (kept outside version control): one small launcher per script to paste into a SerialEM script slot instead of the whole script — `#!Python` followed by `#includeFile <full path to the script>`, which SerialEM reads at run time, so the script window only holds a few characters. This removes the SerialEM confirmation prompt about a long script, which otherwise has to be clicked once per acquired Navigator item and therefore prevents unattended acquisition; as a side effect, an edited `.py` file takes effect immediately, without re-pasting. (The equivalent `RunScriptInFile <file>` command exists as well; it requires a non-Python calling script.)
 - Local tooling (kept outside version control): a comment stripper for the scripts (`strip_comments.py`). It works on the tokenizer, so `#` characters inside strings survive (the progress bar is built from `'#'`, and dialog texts contain `#`), and it refuses to write a file whose result would not compile or whose significant token stream differs from the input. With all comments and docstrings removed, `PACEtomo.py` shrinks from 134 KB to 89 KB and its longest line from 620 to 249 characters.
 - Shortened the two ZLP abort messages and reformatted two long code lines in `PACEtomo.py` (no behaviour change) to keep every line below ~250 characters.
+
+#### PACEtomo_measureBeam.py [v1.0]
+- New helper to test beam centering before using it in the acquisition: `mode = "monitor"` logs the beam shift over time (drift in µm/h, no images), `mode = "test"` runs `AutoCenterBeam` or `CenterBeamFromImage` (beam edges or centroid) `iterations` times and reports the movement, duration, convergence and the status code of the routine. Includes a `maxShift` limit, switches to the View low dose area, and restores the camera area / low dose area (and optionally the beam shift) at the end.
 
 ### 28.09.2026
 #### PACEtomo.py [v1.9.3]
