@@ -7,7 +7,9 @@
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
 # Revision:     v1.9.3
-# Last Change:  2026/09/17: fixed fresh-run NameError on the freeStartTilt exposures (resumePN/resumePlus/resumeMinus/posResumed are now initialized before the first Tilt call); reverted the fineZ frame-saving toggle; fixed resetIS helper name collision; tilt-section trace logging
+# Last Change:  2026/09/28: FEG safety rules for the ZLP refinement (it is never run during dewar refills and never while/right after a FEG flash: new fegSettleTime setting, flash times tracked in the persistent variable PACEfegTime); the refinement is skipped with a warning when the energy filter slit is retracted (ReportEnergyFilter); checkColdFEG flashes on the interval itself and no longer calls LongOperation('FF', -1), which only stamped SerialEM's flash time without flashing
+#               2026/09/28: added moveGroupZ (move the stage to the Z of the current target group before the fine Z correction, so every group starts at its own eucentric height); reworked the energy filter ZLP refinement: it now runs between target groups (at the end of a run) when slitInterval minutes and/or slitNGroup groups have passed, checks the dose rate of a Preview image at the tracking position (falling back to the Navigator item labeled slitNavLabel) and stops the acquisition if the refinement cannot be done; removed the old per-tilt refinement at a position outside the target pattern
+#               2026/09/17: fixed fresh-run NameError on the freeStartTilt exposures (resumePN/resumePlus/resumeMinus/posResumed are now initialized before the first Tilt call); reverted the fineZ frame-saving toggle; fixed resetIS helper name collision; tilt-section trace logging
 #               2026/09/17: added switchAli (re-anchor tracking target at the first branch switch with View and Preview references), tgtAlignTol (retry + skip for failed target centering at startTilt) and maxAlignError (abort data target branch / warn for tracking target when accumulated alignment error exceeds the limit at any tilt)
 #               2026/09/16: added freeStartTilt (first three exposures startTilt, startTilt - step, startTilt + step before the grouped scheme) and swingBreakAngle (large tilt swings split into intermediate moves)
 #               2026/09/16: replaced sem.Eucentricity(1) with fine eucentric Z refinement like Z_byV fineMag=1 (Record-area autofocus defocus); added IS reset loop after target realign
@@ -63,6 +65,7 @@ measureGeo      = False     # estimates pretilt and rotation values of sample by
 fineZ           = True      # perform the fine residual Z correction at the tracking target before acquisition (defocus measurement in the Record low-dose area plus stage Z movement, like Z_byV fineMag=1); if False, NO Z correction is performed by this script at all (the coarse sem.Eucentricity() routine is permanently removed, the lamella eucentric height must be established before the map, e.g. with the z_by_v script)
 fineZTol    = 0.5       # convergence tolerance [um] of the residual Z correction at the tracking target (fine eucentric Z like Z_byV with fineMag=1; corrects a residual target-local Z offset, it does NOT re-establish the lamella eucentric height)
 eucentricTargetDefocus = 0  # target defocus [um] for the fine eucentric Z refinement (0 = eucentric focus)
+moveGroupZ      = True      # move the stage to the Z stored in this group's tracking Navigator item before the fine Z correction, so that every target group starts at its own eucentric height (the stage can still be at the Z of the previous group when the Navigator skips the stage move between items, e.g. with 'Skip stage move to item if possible' in Acquire at Items, or when its move does not include Z)
 
 # Holey support settings
 tgtPattern      = False     # use same tgt pattern on different stage positions (useful for collection on holey support film)
@@ -93,8 +96,12 @@ taOffsetNeg     = 0         # ...negative branch of the tilt series (possibly us
 checkDewar      = True      # check if dewars are refilling before every acquisition
 cryoARM         = True     # if you use a JEOL cryoARM TEM, this will keep the dewar refilling in sync
 coldFEG         = True     # if you use a cold FEG, this will flash the gun whenever the dewars are being refilled
-flashInterval   = -1        # time in hours between cold FEG flashes, -1: flash only during dewar refill (interval is ignored on Krios, uses FlashingAdvised function instead)
-slitInterval    = 0         # time in minutes between centering the energy filter slit using RefineZLP, ONLY works with tgtPattern (needs pattern vectors to find good position for alignment)
+flashInterval   = -1        # time in hours between cold FEG flashes, 0 or -1: flash only during dewar refill (the interval is ignored on Krios, which uses the FlashingAdvised function instead)
+fegSettleTime   = 5         # time [minutes] to wait after a FEG flash before the energy filter ZLP is refined (safety rule: the refinement must not run while the FEG is flashing or has just flashed, because the emission is unstable after a flash); the time of the last flash is kept in the persistent variable PACEfegTime; 0 = do not wait (flashes triggered by the script are blocking operations, so the refinement can never run during the flash itself)
+slitInterval    = 0         # time [minutes] since the last energy filter ZLP refinement after which the slit is re-centered at the end of a target group (0 = no time criterion); the refinement is done between groups, i.e. after the tilt series of a group is completed and before the next group is started
+slitNGroup      = 0         # number of completed target groups after which the slit is re-centered at the end of a group (0 = no group criterion); at least one of slitInterval and slitNGroup must be set to enable the refinement
+slitMinCounts   = 0         # minimum dose rate [unbinned counts/s] of the Preview image used to check the signal before the ZLP refinement: the ZLP should be centered where the beam passes through as little material as possible (an empty/broken area or the thinnest ice), which also gives the highest count rate, so the dose rate is used to find such a position; if the value at the target group is below it, the script moves to the Navigator item labeled slitNavLabel and checks there, and if the dose is insufficient there as well the acquisition is stopped (0 = do not check the dose, refine at the current position)
+slitNavLabel   = "ZLP"      # label (or note) of the Navigator item that marks a position with as little material in the beam as possible (an empty/broken area or the thinnest ice) for the ZLP refinement, used when the target group itself is too thick
 
 # Advanced settings
 fitLimit        = 30        # refineGeo: minimum resolution [Angstroms] needed for CTF fit to be considered for refineGeo
@@ -170,6 +177,7 @@ def checkFilling():
             sem.LongOperation("RS", "0", "RT", "0")
         if coldFEG:                                                                             # flash gun while dewars refill
             sem.LongOperation("FF", "0")
+            reportFEGFlash()
     while filling >= 1:
         log("Dewars are still filling...")
         sem.Delay(60, "s")
@@ -178,7 +186,56 @@ def checkFilling():
         log(f"Dewars finished filling after {(time.time() - timerStart) / 60} minutes.")
         dewarFillTime = time.time() - timerStart
 
+def reportFEGFlash():                                                                           # record the time of a FEG flash (persistent, so it is also known in the following runs)
+    sem.ReportMinuteTime("PACEfegTime")
+
+def fegFlashDue():                                                                              # is a FEG flash due (flashInterval in hours; 0 or less: flash only during dewar refills)
+    if flashInterval <= 0:
+        return False
+    if int(sem.IsVariableDefined("PACEfegTime")) == 0:
+        return True                                                                             # no flash recorded yet
+    return float(sem.ReportMinuteTime()) - float(sem.GetVariable("PACEfegTime")) >= flashInterval * 60
+
+def waitForDewars():                                                                            # safety rule: no ZLP refinement while the dewars are refilling
+    if int(sem.AreDewarsFilling()) < 1:
+        return
+    log("NOTE: The dewars are filling. Waiting for the refill to finish before the ZLP refinement...")
+    if checkDewar:
+        checkFilling()                                                                          # waits for the refill (and flashes the gun when a refill starts)
+    else:
+        while int(sem.AreDewarsFilling()) >= 1:
+            log("Dewars are still filling...")
+            sem.Delay(60, "s")
+
+def waitForFEGSettle():                                                                         # safety rule: no ZLP refinement while or right after the FEG was flashed
+    if not coldFEG or fegSettleTime <= 0:
+        return
+    if int(sem.IsVariableDefined("PACEfegTime")) == 0:
+        log("DEBUG: No FEG flash has been recorded yet, not waiting for the gun to settle.")
+        return
+    since = float(sem.ReportMinuteTime()) - float(sem.GetVariable("PACEfegTime"))
+    waited = 0
+    while since < fegSettleTime and waited < fegSettleTime + 2:                                 # bounded loop: the reported time may only advance in whole minutes
+        wait = int(min(300, np.ceil((fegSettleTime - since) * 60)))                             # wait in chunks of at most 5 min, so the log shows the progress
+        log(f"NOTE: Waiting {wait} s for the FEG to settle after the last flash ({round(since, 1)} min ago, fegSettleTime = {fegSettleTime} min)...")
+        sem.Delay(wait, "s")
+        waited += wait / 60
+        since = float(sem.ReportMinuteTime()) - float(sem.GetVariable("PACEfegTime"))
+    if since < fegSettleTime:
+        log(f"WARNING: Could not confirm that the FEG has settled after the last flash ({round(since, 1)} min ago, fegSettleTime = {fegSettleTime} min). Continuing with the ZLP refinement.")
+
+def reportSlitState():                                                                          # slit width, energy loss, and whether the slit is inserted (None if not reported)
+    try:
+        slitWidth, energyLoss, slitIn, *_ = sem.ReportEnergyFilter()
+        return float(slitWidth), float(energyLoss), int(slitIn)
+    except Exception as e:
+        log(f"DEBUG: Energy filter state could not be read ({e}).")
+        return None, None, None
+
 def checkColdFEG():
+    """Flash the FEG when it is due (flashInterval in hours; 0 or less: flash only during dewar refills)
+    or when it is advised on a Krios. The time of every flash is recorded in the persistent variable
+    PACEfegTime, which is used to keep the ZLP refinement away from flashes (see waitForFEGSettle)."""
     if not cryoARM:                                                                             # Routine for Krios CFEG with Advanced scripting >4
         flashLow = 0
         flashHigh = sem.IsFEGFlashingAdvised(1)
@@ -188,19 +245,124 @@ def checkColdFEG():
             flashLow = sem.IsFEGFlashingAdvised(0)
         if flashLow == 1 or flashHigh ==1:
             sem.LongOperation("FF", "0")
-    else:
-            sem.LongOperation("FF", str(flashInterval))
+            reportFEGFlash()
+    elif fegFlashDue():
+        log(f"NOTE: Flashing the cold FEG (interval: {flashInterval} h).")
+        sem.LongOperation("FF", "0")
+        reportFEGFlash()
 
-def checkSlit(vec, size, tilt, pn):                                                             # check ZLP in hole outside of pattern along tilt axis
-    global lastSlitCheck
-    log("Refining ZLP...", style=1)
-    sem.SetImageShift(position[0][pn]["ISXset"], position[0][pn]["ISYset"])
-    shift = vec * (size + 1)
-    shift[1] *= np.cos(np.radians(tilt))
-    sem.ImageShiftByMicrons(*shift)
-    sem.RefineZLP()
-    sem.SetImageShift(position[0][pn]["ISXset"], position[0][pn]["ISYset"])
-    lastSlitCheck = sem.ReportClock()
+def abortSlitZLP(message):                                                                      # stop the acquisition if the ZLP refinement cannot be done
+    log("ERROR: " + message)
+    navAcq = sem.ReportIfNavAcquiring()
+    if (int(navAcq[0]) if isinstance(navAcq, (tuple, list)) else int(navAcq)) == 1:
+        log("NOTE: Stopping the Navigator acquisition so that no data is collected with a mis-aligned energy filter.")
+        sem.EndAcquireAtItems(1)
+    sem.OKBox(message + "\n\nThe acquisition was stopped. Please check the energy filter, the beam and the ZLP position in the Navigator before restarting!")
+    sem.SaveLog()
+    sem.Exit()
+
+def runZLPRefinement():                                                                         # run RefineZLP, abort if it fails
+    error = None
+    sem.NoMessageBoxOnError(1)
+    try:
+        sem.RefineZLP()
+    except Exception as e:
+        error = e
+    finally:
+        sem.NoMessageBoxOnError(0)
+    if error is not None:
+        abortSlitZLP(f"The energy filter ZLP refinement failed ({error})!")
+
+def findSlitNavItem():                                                                          # index of the Navigator item that marks a position for the ZLP refinement
+    zlpID = int(sem.NavIndexWithLabel(slitNavLabel))
+    if zlpID == 0:
+        zlpID = int(sem.NavIndexWithNote(slitNavLabel))
+    return zlpID
+
+def measureSlitDose(where):                                                                     # dose rate of a Preview image at the current position [unbinned counts/s]
+    sem.SetImageShift(0, 0)
+    sem.L()
+    counts = float(sem.ReportMeanCounts("A", 1))
+    log(f"ZLP dose check at {where}: {round(counts, 2)} counts/s (minimum: {slitMinCounts} counts/s; a low value means that too much material is in the beam)")
+    return counts
+
+def checkSlitZLP():
+    """Refine the energy filter zero-loss peak between target groups.
+
+    One of the two criteria must be set: slitInterval (minutes since the last refinement) and/or
+    slitNGroup (number of completed groups since the last refinement). When a criterion is met, the
+    refinement is done at the end of the current group, before the next group is started: the stage
+    is tilted back to the start tilt and the dose rate of a Preview image is measured at the tracking
+    position of the group. The ZLP should be centered where the beam passes through as little
+    material as possible (an empty/broken area or the thinnest ice), which also gives the highest
+    count rate; if the dose rate is below slitMinCounts, the stage is moved to the Navigator item
+    labeled slitNavLabel and the measurement is repeated there. If the dose is insufficient there as
+    well, or the refinement fails, the Navigator acquisition is stopped, so that no data is acquired
+    with a mis-aligned energy filter. The time and the group count of the last refinement are kept in
+    persistent variables, so the criteria also work across the separate runs of a group series.
+
+    Safety rules: the refinement is never run while the dewars are refilling (the refill is waited
+    out, since the tanks have to be filled before the next group is acquired anyway) and never while
+    the FEG is flashing or has just flashed (flashes are blocking operations, so the refinement
+    cannot run during the flash itself; a wait of fegSettleTime minutes after the last flash, which
+    is recorded in the persistent variable PACEfegTime, keeps it away from the unstable emission
+    right after a flash). The slit state is checked with ReportEnergyFilter first: with a retracted
+    slit the refinement is skipped with a warning, since there is nothing to center."""
+
+    if slitInterval <= 0 and slitNGroup <= 0:
+        return
+
+    now = float(sem.ReportMinuteTime())
+    if int(sem.IsVariableDefined("PACEslitTime")) == 1 and int(sem.IsVariableDefined("PACEslitGroups")) == 1:
+        elapsed = now - float(sem.GetVariable("PACEslitTime"))
+        groups = float(sem.GetVariable("PACEslitGroups")) + 1                                   # the group that was just completed is counted
+        initialized = True
+    else:
+        elapsed = None
+        groups = 1
+        initialized = False
+
+    if not ((slitInterval > 0 and elapsed is not None and elapsed >= slitInterval) or
+            (slitNGroup > 0 and groups >= slitNGroup)):
+        if not initialized:                                                                     # first run with these criteria: only start the time reference
+            sem.ReportMinuteTime("PACEslitTime")
+            log("NOTE: Energy filter ZLP refinement counters were initialized (no previous refinement found).")
+        sem.SetPersistentVar("PACEslitGroups", str(int(groups)))
+        log(f"DEBUG: Energy filter ZLP refinement is not due yet ({int(groups)} group(s) acquired, {round(elapsed, 1) if elapsed is not None else 'no'} min since the last refinement).")
+        return
+
+    log(f"Refining the energy filter ZLP ({int(groups)} group(s) acquired, {round(elapsed, 1) if elapsed is not None else 'no'} min since the last refinement)...", style=1)
+    waitForDewars()                                                                             # safety rule: no ZLP refinement while the dewars are refilling...
+    waitForFEGSettle()                                                                          # ...or while the FEG is flashing / has just flashed
+    slitWidth, energyLoss, slitIn = reportSlitState()                                           # ...and only with the slit inserted
+    if slitIn == 0:
+        log("WARNING: The energy filter slit is retracted. Skipping the ZLP refinement, since there is nothing to center (the refinement is attempted again at the next group).")
+        return
+    if slitIn is not None:
+        log(f"Energy filter: slit {slitWidth} eV, energy loss {energyLoss} eV, slit inserted.")
+    sem.GoToLowDoseArea("R")                                                                    # the stage is still at the tracking position of this group
+    sem.TiltTo(startTilt)                                                                       # refine the ZLP at the anchor tilt of the tilt series
+    zlpID = 0
+    stagePos = None
+    if slitMinCounts > 0:
+        if measureSlitDose("the target group") < slitMinCounts:
+            zlpID = findSlitNavItem()
+            if zlpID == 0:
+                abortSlitZLP(f"The dose rate is too low for the ZLP refinement and no Navigator item labeled [{slitNavLabel}] was found!")
+            stagePos = sem.ReportStageXYZ()                                                     # stage position of the target group, to return to it afterwards
+            log(f"NOTE: Moving to the ZLP position (Navigator item [{zlpID}]) for the energy filter refinement...")
+            sem.MoveToNavItem(zlpID)
+            if measureSlitDose(f"the ZLP position [{zlpID}]") < slitMinCounts:
+                abortSlitZLP(f"The dose rate is too low for the ZLP refinement, both at the target group and at the ZLP position [{zlpID}]!")
+    waitForDewars()                                                                             # in case a refill started during the dose check
+    waitForFEGSettle()
+    runZLPRefinement()
+    if zlpID != 0:
+        sem.MoveStageTo(*stagePos)
+        log("NOTE: Moved back to the tracking position of the target group.")
+    sem.ReportMinuteTime("PACEslitTime")                                                        # store the time of this refinement for the following runs
+    sem.SetPersistentVar("PACEslitGroups", "0")
+    log("NOTE: Energy filter ZLP refinement done.")
 
 def checkValves():
     if not int(sem.ReportColumnOrGunValve()):
@@ -1048,7 +1210,11 @@ def Tilt(tilt):
                         montSSX, montSSY = c2ssMatrix @ np.array([montX, montY])
 
                         # With sample geometry (needs to be tested)
-                        correctedFocus = position[pos][pn]["focus"] - np.cos(np.radians(realTilt)) * np.tan(np.radians(pretilt)) * (np.cos(np.radians(rotation)) / np.cos(np.radians(realTilt)) * montSSY - np.sin(np.radians(rotation)) * montSSX) - np.tan(np.radians(realTilt)) * montSSY 
+                        correctedFocus = (position[pos][pn]["focus"]
+                                          - np.cos(np.radians(realTilt)) * np.tan(np.radians(pretilt))
+                                          * (np.cos(np.radians(rotation)) / np.cos(np.radians(realTilt)) * montSSY
+                                             - np.sin(np.radians(rotation)) * montSSX)
+                                          - np.tan(np.radians(realTilt)) * montSSY) 
                         # Without sample geometry
                         #correctedFocus = position[pos][pn]["focus"] - np.tan(np.radians(realTilt)) * montSSY
 
@@ -1150,7 +1316,10 @@ def Tilt(tilt):
             position[pos][pn]["shifts"].pop(0)
             position[pos][pn]["angles"].pop(0)
 
-        position[pos][pn]["z0"], cov = optimize.curve_fit(calcSSChange, np.vstack((position[pos][pn]["angles"], [position[pos][pn]["n0"] for i in range(0, len(position[pos][pn]["angles"]))])), position[pos][pn]["shifts"], p0=(position[pos][pn]["z0"]))
+        fitAngles = [position[pos][pn]["n0"] for i in range(0, len(position[pos][pn]["angles"]))]
+        position[pos][pn]["z0"], cov = optimize.curve_fit(calcSSChange,
+                                                          np.vstack((position[pos][pn]["angles"], fitAngles)),
+                                                          position[pos][pn]["shifts"], p0=(position[pos][pn]["z0"]))
         position[pos][pn]["z0"] = position[pos][pn]["z0"][0]
 
         if doCtfFind:
@@ -1227,10 +1396,6 @@ def Tilt(tilt):
                 log(f"WARNING: Target [{pos + 1}] has reached the final tilt angle. This branch will be aborted.")            
 
         updateTargets(runFileName, targets, position, position[pos][pn]["sec"], pos)    
-
-### Refine energy filter slit if appropriate
-    if tgtPattern and slitInterval > 0 and (lastSlitCheck - sem.ReportClock() / 60) > slitInterval:
-        checkSlit(np.array([vecB0, vecB1]), size, realTilt, pn)
 
     if zeroExpTime > 0 and tilt == startTilt:
         sem.RestoreCameraSet("R")
@@ -1404,6 +1569,17 @@ if not recover:
     log("Moving to target area...")
 
     sem.MoveToNavItem(navID)
+    if moveGroupZ:                                                                           # every target group has its own eucentric Z
+        _, _, _, groupZ, *_ = sem.ReportOtherItem(navID)                                     # tracking Navigator item of this group (index, stage X, Y, Z, item type)
+        groupZ = float(groupZ)
+        curX, curY, curZ = sem.ReportStageXYZ()
+        if groupZ == 0:                                                                      # SerialEM convention: an item Z of 0 means that no Z was assigned
+            log(f"WARNING: The tracking Navigator item [{navID}] of this target group has no Z (0 um)! Keeping the current stage Z ({round(curZ, 2)} um).")
+        elif abs(curZ - groupZ) > fineZTol:                                                  # a whole-group Z offset is out of reach of the residual Z correction below
+            log(f"Moving to the Z of this target group: {round(curZ, 2)} um -> {round(groupZ, 2)} um (Navigator item [{navID}]).")
+            sem.MoveStageTo(curX, curY, groupZ)
+        else:
+            log(f"Stage Z is already at the Z of this target group ({round(curZ, 2)} um, Navigator item [{navID}]).")
     if fineZ:
         sem.SetCameraArea("V", "F")                                                             # set View to Full for the fine Z correction (restored below)
         log("Correcting residual eucentric Z at the tracking target...")                         # residual correction only: the lamella eucentric height should be set before the map (e.g. with z_by_v), this refines the tracking target to it
@@ -1807,7 +1983,6 @@ if not recover:
     maxProgress = ((maxTilt - minTilt) / step + 1) * (len(position) - skippedTgts)
     resumePercent = 0
     startTime = sem.ReportClock()
-    lastSlitCheck = startTime
 
     geo = [[], [], []]
 
@@ -1998,7 +2173,6 @@ else:
         minustilt = startTilt - step
 
     startTime = sem.ReportClock()
-    lastSlitCheck = startTime
 
 
 ### Tilt series
@@ -2043,6 +2217,9 @@ else:
                 sortTS(target["tsfile"])
             if binFinalStack > 1:
                 binStack(target["tsfile"], binFinalStack)
+
+### Energy filter ZLP refinement between target groups
+checkSlitZLP()
 
 totalTime = round(sem.ReportClock() / 60, 1)
 perTime = round(totalTime / len(position), 1)
