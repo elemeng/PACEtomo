@@ -7,7 +7,10 @@
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
 # Revision:     v1.9.3
-# Last Change:  2026/09/28: FEG safety rules for the ZLP refinement (it is never run during dewar refills and never while/right after a FEG flash: new fegSettleTime setting, flash times tracked in the persistent variable PACEfegTime); the refinement is skipped with a warning when the energy filter slit is retracted (ReportEnergyFilter); checkColdFEG flashes on the interval itself and no longer calls LongOperation('FF', -1), which only stamped SerialEM's flash time without flashing
+# Last Change:  2026/09/30: tiltToBreaks now logs the splitting of a large tilt swing (header line plus one line per segment), so the split is visible in the log - the tilt angles of the series (e.g. 48/51/-48/-51 degrees) are not limited by swingBreakAngle, only the stage move is
+#               2026/09/30: realignToItem now selects the realignment method in the recovery path as well (it previously always used SerialEM's RealignToItem there, so False did not mean "no RealignToItem"); setting description updated (RealignToItem moves the stage Z, the script's own realignment only moves X/Y)
+#               2026/09/30: fixed a crash at the first dewar refill / FEG flash: the Python module's ReportMinuteTime takes NO argument (assigning the value to a named persistent variable is a feature of the SerialEM script language, not of the Python wrapper), so the flash and refinement times are now stored with SetPersistentVar (helper storeMinuteTime); all sem.* calls of the scripts were audited against the module's command list afterwards
+#               2026/09/28: FEG safety rules for the ZLP refinement (it is never run during dewar refills and never while/right after a FEG flash: new fegSettleTime setting, flash times tracked in the persistent variable PACEfegTime); the refinement is skipped with a warning when the energy filter slit is retracted (ReportEnergyFilter); checkColdFEG flashes on the interval itself and no longer calls LongOperation('FF', -1), which only stamped SerialEM's flash time without flashing
 #               2026/09/28: added moveGroupZ (move the stage to the Z of the current target group before the fine Z correction, so every group starts at its own eucentric height); reworked the energy filter ZLP refinement: it now runs between target groups (at the end of a run) when slitInterval minutes and/or slitNGroup groups have passed, checks the dose rate of a Preview image at the tracking position (falling back to the Navigator item labeled slitNavLabel) and stops the acquisition if the refinement cannot be done; removed the old per-tilt refinement at a position outside the target pattern
 #               2026/09/17: fixed fresh-run NameError on the freeStartTilt exposures (resumePN/resumePlus/resumeMinus/posResumed are now initialized before the first Tilt call); reverted the fineZ frame-saving toggle; fixed resetIS helper name collision; tilt-section trace logging
 #               2026/09/17: added switchAli (re-anchor tracking target at the first branch switch with View and Preview references), tgtAlignTol (retry + skip for failed target centering at startTilt) and maxAlignError (abort data target branch / warn for tracking target when accumulated alignment error exceeds the limit at any tilt)
@@ -63,7 +66,7 @@ measureGeo      = False     # estimates pretilt and rotation values of sample by
 # targets centred on the positions you defined. A better eucentricity correction also reduces the
 # target-off drift that otherwise builds up at high tilt angles.
 fineZ           = True      # perform the fine residual Z correction at the tracking target before acquisition (defocus measurement in the Record low-dose area plus stage Z movement, like Z_byV fineMag=1); if False, NO Z correction is performed by this script at all (the coarse sem.Eucentricity() routine is permanently removed, the lamella eucentric height must be established before the map, e.g. with the z_by_v script)
-fineZTol    = 0.5       # convergence tolerance [um] of the residual Z correction at the tracking target (fine eucentric Z like Z_byV with fineMag=1; corrects a residual target-local Z offset, it does NOT re-establish the lamella eucentric height)
+fineZTol        = 0.5       # convergence tolerance [um] of the residual Z correction at the tracking target (fine eucentric Z like Z_byV with fineMag=1; corrects a residual target-local Z offset, it does NOT re-establish the lamella eucentric height)
 eucentricTargetDefocus = 0  # target defocus [um] for the fine eucentric Z refinement (0 = eucentric focus)
 moveGroupZ      = True      # move the stage to the Z stored in this group's tracking Navigator item before the fine Z correction, so that every target group starts at its own eucentric height (the stage can still be at the Z of the previous group when the Navigator skips the stage move between items, e.g. with 'Skip stage move to item if possible' in Acquire at Items, or when its move does not include Z)
 
@@ -90,7 +93,7 @@ extendedMdoc    = True      # saves additional info to .mdoc file
 
 # Hardware settings
 slowTilt        = True     # do backlash step for all tilt angles, on bad stages large tilt steps are less accurate
-swingBreakAngle = 45        # maximum stage tilt movement [degrees] in one swing between exposures; larger swings are split into intermediate moves (no images taken in between) to reduce off-target caused by large tilt moves, 0 disables splitting
+swingBreakAngle = 30        # maximum stage tilt movement [degrees] in one swing between exposures; larger swings are split into intermediate moves (no images taken in between) to reduce off-target caused by large tilt moves, 0 disables splitting
 taOffsetPos     = 0         # additional tilt axis offset values [microns] applied to calculations for positive and...
 taOffsetNeg     = 0         # ...negative branch of the tilt series (possibly useful for side-entry holder systems)
 checkDewar      = True      # check if dewars are refilling before every acquisition
@@ -99,8 +102,8 @@ coldFEG         = True     # if you use a cold FEG, this will flash the gun when
 flashInterval   = -1        # time in hours between cold FEG flashes, 0 or -1: flash only during dewar refill (the interval is ignored on Krios, which uses the FlashingAdvised function instead)
 fegSettleTime   = 5         # time [minutes] to wait after a FEG flash before the energy filter ZLP is refined (safety rule: the refinement must not run while the FEG is flashing or has just flashed, because the emission is unstable after a flash); the time of the last flash is kept in the persistent variable PACEfegTime; 0 = do not wait (flashes triggered by the script are blocking operations, so the refinement can never run during the flash itself)
 slitInterval    = 0         # time [minutes] since the last energy filter ZLP refinement after which the slit is re-centered at the end of a target group (0 = no time criterion); the refinement is done between groups, i.e. after the tilt series of a group is completed and before the next group is started
-slitNGroup      = 0         # number of completed target groups after which the slit is re-centered at the end of a group (0 = no group criterion); at least one of slitInterval and slitNGroup must be set to enable the refinement
-slitMinCounts   = 0         # minimum dose rate [unbinned counts/s] of the Preview image used to check the signal before the ZLP refinement: the ZLP should be centered where the beam passes through as little material as possible (an empty/broken area or the thinnest ice), which also gives the highest count rate, so the dose rate is used to find such a position; if the value at the target group is below it, the script moves to the Navigator item labeled slitNavLabel and checks there, and if the dose is insufficient there as well the acquisition is stopped (0 = do not check the dose, refine at the current position)
+slitNGroup      = 1         # number of completed target groups after which the slit is re-centered at the end of a group (0 = no group criterion); at least one of slitInterval and slitNGroup must be set to enable the refinement
+slitMinCounts   = 5         # minimum dose rate [unbinned counts/s] of the Preview image used to check the signal before the ZLP refinement: the ZLP should be centered where the beam passes through as little material as possible (an empty/broken area or the thinnest ice), which also gives the highest count rate, so the dose rate is used to find such a position; if the value at the target group is below it, the script moves to the Navigator item labeled slitNavLabel and checks there, and if the dose is insufficient there as well the acquisition is stopped (0 = do not check the dose, refine at the current position)
 slitNavLabel   = "ZLP"      # label (or note) of the Navigator item that marks a position with as little material in the beam as possible (an empty/broken area or the thinnest ice) for the ZLP refinement, used when the target group itself is too thick
 
 # Advanced settings
@@ -109,12 +112,12 @@ parabolTh       = 9         # refineGeo: minimum number of passable CtfFind valu
 imageShiftLimit = 20        # maximum image shift [microns] SerialEM is allowed to apply (this is a SerialEM property entry, default is 15 microns)
 dataPoints      = 4         # number of recent specimen shift data points used for estimation of eucentric offset (default: 4)
 alignLimit      = 0.5       # maximum shift [microns] allowed for record tracking between tilts, should reduce loss of target in case of low contrast (not applied for tracking TS); also the threshold to take a second tracking image when using trackTwice
-resetIS_AlignTo_Limit  = 1    # maximum residual image shift [microns] allowed at the tracking target after the initial realignment; if exceeded, the image shift is reset (stage move via ResetImageShift) and the target realigned with View until the IS is below this limit, so that the IS of the other targets in the group stays within imageShiftLimit
+resetIS_AlignTo_Limit  = 3    # maximum residual image shift [microns] allowed at the tracking target after the initial realignment; if exceeded, the image shift is reset (stage move via ResetImageShift) and the target realigned with View until the IS is below this limit, so that the IS of the other targets in the group stays within imageShiftLimit
 tgtAlignTol     = 200       # maximum residual alignment error [nm] allowed when centering a target at startTilt during target setup; if exceeded, the alignment is retried once and if it still fails the target is marked for skipping (for the tracking target only a warning is issued)
-maxAlignError   = 200       # maximum accumulated alignment error [nm] allowed for a target during the tilt series, relative to its startTilt reference; if exceeded for a data target, its branch is aborted to avoid collecting off-target data at high tilts, for the tracking target a warning is issued (large tracking corrections can also indicate that the image shift limit will be reached)
+maxAlignError   = 1000       # maximum accumulated alignment error [nm] allowed for a target during the tilt series, relative to its startTilt reference; if exceeded for a data target, its branch is aborted to avoid collecting off-target data at high tilts, for the tracking target a warning is issued (large tracking corrections can also indicate that the image shift limit will be reached)
 minCounts       = 0         # minimum mean counts per second of record image (if set > 0, tilt series branch will be aborted if mean counts are not sufficient)
 ignoreNegStart  = False      # ignore first shift on 2nd branch, which is usually very large on bad stages
-realignToItem   = False     # Use SerialEM's RealignToItem routine instead of simple image realignment (was default in PACEtomo <=v1.9.1)
+realignToItem   = False     # Use SerialEM's RealignToItem routine instead of the script's own realignment (move to the target's stage position and align to the saved View/Preview references) for the realignment of the tracking target: applies both at the start of a fresh run and to the realign offered when resuming a run. NOTE: RealignToItem also moves the stage Z to the item's Z, while the script's own realignment only moves X/Y (so Z stays with fineZ/moveGroupZ). (was default in PACEtomo <=v1.9.1)
 refFromPreview  = False     # Makes temporary reference from Preview image collected during previewAli for use with first Record image
 noZeroRecAli    = False     # Skip alignment of first tilt image to reference 
 autoStartTilt   = False     # Uses measured pretilt to set compensating startTilt      
@@ -186,8 +189,13 @@ def checkFilling():
         log(f"Dewars finished filling after {(time.time() - timerStart) / 60} minutes.")
         dewarFillTime = time.time() - timerStart
 
+def storeMinuteTime(name):                                                                      # store the current absolute time [min] in a persistent variable
+    # NOTE: the Python module's ReportMinuteTime takes NO argument - assigning the value to a named
+    # variable is a feature of the SerialEM script language, not of the Python wrapper.
+    sem.SetPersistentVar(name, str(float(sem.ReportMinuteTime())))
+
 def reportFEGFlash():                                                                           # record the time of a FEG flash (persistent, so it is also known in the following runs)
-    sem.ReportMinuteTime("PACEfegTime")
+    storeMinuteTime("PACEfegTime")
 
 def fegFlashDue():                                                                              # is a FEG flash due (flashInterval in hours; 0 or less: flash only during dewar refills)
     if flashInterval <= 0:
@@ -325,7 +333,7 @@ def checkSlitZLP():
     if not ((slitInterval > 0 and elapsed is not None and elapsed >= slitInterval) or
             (slitNGroup > 0 and groups >= slitNGroup)):
         if not initialized:                                                                     # first run with these criteria: only start the time reference
-            sem.ReportMinuteTime("PACEslitTime")
+            storeMinuteTime("PACEslitTime")
             log("NOTE: Energy filter ZLP refinement counters were initialized (no previous refinement found).")
         sem.SetPersistentVar("PACEslitGroups", str(int(groups)))
         log(f"DEBUG: Energy filter ZLP refinement is not due yet ({int(groups)} group(s) acquired, {round(elapsed, 1) if elapsed is not None else 'no'} min since the last refinement).")
@@ -360,7 +368,7 @@ def checkSlitZLP():
     if zlpID != 0:
         sem.MoveStageTo(*stagePos)
         log("NOTE: Moved back to the tracking position of the target group.")
-    sem.ReportMinuteTime("PACEslitTime")                                                        # store the time of this refinement for the following runs
+    storeMinuteTime("PACEslitTime")                                                             # store the time of this refinement for the following runs
     sem.SetPersistentVar("PACEslitGroups", "0")
     log("NOTE: Energy filter ZLP refinement done.")
 
@@ -818,8 +826,10 @@ def tiltToBreaks(tilt):
         sem.TiltTo(tilt)
         return
     cur = float(sem.ReportTiltAngle())
+    log(f"NOTE: Splitting the tilt swing {round(cur, 1)} -> {round(tilt, 1)} deg into moves of at most {swingBreakAngle} deg.")
     while abs(tilt - cur) > swingBreakAngle:
         cur += np.sign(tilt - cur) * swingBreakAngle
+        log(f"NOTE: Swing segment: tilting to {round(cur, 1)} deg.")
         sem.TiltTo(cur)
     sem.TiltTo(tilt)
 
@@ -2054,8 +2064,10 @@ else:
             sem.CropCenterToSize("A", int(x), int(y))
             alignTo("P", debug)
             sem.RestoreCameraSet("V")
-        else:
+        elif realignToItem:                                                                 # same choice as in a fresh run, so the setting is not misleading
             sem.RealignToOtherItem(navID, 1)
+        else:
+            realignTo(nav_id=navID, target=targets[0])
         resetISAlignToLimit(targets[0])                                                     # zero residual IS at the tracking target (once per exposure group)
     position = []
     skippedTgts = 0

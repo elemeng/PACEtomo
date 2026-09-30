@@ -76,6 +76,11 @@ def reportBeamSize():
         log(f"DEBUG: Beam diameter could not be measured ({e}).")
         return None
 
+def reportFOV():
+    """Field of view [um] of the image in A, plus the pixel size [nm] and the binning for the log."""
+    sizeX, sizeY, binning, exp, pixSize, *_ = sem.ImageProperties("A")
+    return float(sizeX) * float(pixSize) / 1000.0, float(pixSize), int(binning)
+
 def checkValves():
     if not int(sem.ReportColumnOrGunValve()):
         log("NOTE: The column/gun valve was closed. Opening it.")
@@ -109,9 +114,16 @@ def centerBeam():
             sem.V()
             sem.Delay(settleDelay, "s")
             if measureSize:
+                fov, pixSize, binning = reportFOV()
                 size = reportBeamSize()
+                counts = round(float(firstValue(sem.ReportMeanCounts())), 1)
                 if size is not None:
-                    log(f"Beam diameter in the View image: {round(size, 2)} um (mean counts: {round(float(firstValue(sem.ReportMeanCounts())), 1)})")
+                    log(f"Beam diameter {round(size, 2)} um in a field of view of {round(fov, 2)} um "
+                        f"(beam/FOV = {round(size / fov, 2)}x, {round(pixSize, 2)} nm/px bin {binning}, mean counts {counts})")
+                else:
+                    log(f"WARNING: No beam edge was found in a field of view of {round(fov, 2)} um "
+                        f"({round(pixSize, 2)} nm/px bin {binning}, mean counts {counts}): the beam probably covers the whole image. "
+                        f"An edge fit cannot determine its center from that - use the View low dose area or AutoCenterBeam with #P (reduced beam size).")
             code = int(firstValue(sem.CenterBeamFromImage(centroid, maxShift)))
             status = {0: "moved", -1: "no beam edges detected", 5: "circle fit to the beam edges failed",
                       6: "not moved: radius too high", 7: "not moved: fitting error too high"}.get(code, f"code {code}")
