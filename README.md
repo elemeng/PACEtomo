@@ -414,6 +414,33 @@ Fixed the `switchAli` re-anchor at the first branch switch.
 
 </details>
 
+#### PACEtomo_targetsFromMontage.py [v1.12]
+New `liveReferences` mode (default): a real View and a Preview image are taken at every target and used as its references, with the target re-aligned to its point in the map first.
+<details>
+<summary>Changes</summary>
+
+- New setting **`liveReferences`** (default `True`): for every point of the group a real **View and Preview image are taken at the target and used as its references**, instead of cropping them out of the montage map. The references then carry the resolution of the live images (the virtual Preview map was an upsampled View-mag crop) and the padding/scale problems of virtual maps cannot occur. Cost: one View and one Preview exposure per point plus a stage move, i.e. about what [*PACEtomo_selectTargets.py*](https://github.com/eisfabian/PACEtomo/blob/main/PACEtomo_selectTargets.py) takes per target. The montage is still needed, because it is where the points are placed and how they are located. Set `liveReferences = False` to get the previous behaviour (crop the references out of the map, no extra exposure per target).
+- Before the pair of images the target is **re-aligned to the position of the point in the map** with the image shift, because that is what the target accuracy depends on: a position taken from the map is only as accurate as the registration of the map (a few hundred nm), and a target that is off-centre in its references ends up off-centre in the Record images, since PACEtomo aligns the acquired images to those references. `FindOffsetInImage` locates the map content around the point in the live View image by cross-correlation (masked so that the part of the image beyond the map cannot contribute, and gated by the match quality and by how clearly the peak stands out from the next one), `OffsetToStage` converts the offset with SerialEM's own image to stage transformation (`BufImageToStageMatrix`) and `ImageShiftByStageDiff` applies it as an image shift. Up to three View images are taken until the target is within `refAlignTol` (default `0.05` µm); the direction of the correction is inverted if a correction does not improve the position, and the best of the images is kept as the reference.
+- The Preview image is taken with the same image shift and re-aligned the same way, because it is the finer of the two references and therefore decides where the target ends up. Every offset, match quality and peak ratio is logged per point, e.g. `Target is 0.213 um from the requested position (match quality 0.71)`, so the accuracy of the re-alignment can be judged from the log.
+- After the references of a point the image shift is reset (with the stage compensating, so the field stays put), and after all points the stage is returned to the position the script started at.
+- The live reference images are written with the pixel size and dimensions of the live images, and are compared with the templates: a mismatch (e.g. changed low dose View or Preview settings) is reported as a warning.
+- `liveReferences` needs a real microscope: in DUMMY mode the script falls back to cropping the references and says so in the log.
+- Also fixed: the `MapMinMaxScale` of the View map items of every target used the scale of the last cropped View image instead of that of its own image.
+
+</details>
+
+#### PACEtomo_targetsFromMontage.py [v1.11]
+Each target of a group is cropped from the map it was actually added on, and the script reports where it is in its progress.
+<details>
+<summary>Changes</summary>
+
+- **Points can now be added on different maps** (e.g. on sections 2, 3, 4 of a multi-section view map) without breaking the script. SerialEM's `GetNavGroupImageCoords` returns the image coordinates of the group's points only on the map that is loaded, so such points were either dropped (and the following targets were then cropped at the wrong place, because the coordinates were still indexed by the position within the group) or the run was aborted. The maps each point was added on are now taken from the Navigator file (`GroupID` + `DrawnID` of each point, the map items by `MapID`, in table order, checked against the stage coordinates SerialEM reports for the group), each map is loaded when it is needed, and the coordinates are queried per item with `ReportItemImageCoords`. The per-item coordinates are only used after they have been shown to agree with the group coordinates for the points on the loaded map, so a disagreement (unexpected Navigator file, DUMMY mode) falls back to the old behaviour with a warning instead of producing wrong references.
+- A group whose points cannot be placed at all (file and SerialEM disagree, or DUMMY mode) is still reported and stops the run with the same explanation as in v1.10, rather than writing targets with references taken from the wrong map.
+- Added a **version banner** (`NOTE: PACEtomo_targetsFromMontage, Revision v1.11 (2026/10/15). If this line does not show the version you expect, the script that ran is not this file.`), the **targets file path** as soon as it is known (including the numeric suffix that is added when a file of that name already exists), the Navigator file name with its number of items, the number of points and the number of maps of the group, and a line per edge target whose references are padded.
+- `ReportNavFile` is now called before `SaveNavigator` and its failure is reported explicitly (`ERROR: There is no Navigator file defined`) instead of leaving a file chooser or an unrelated error: the script needs a saved Navigator file, because that is where the maps of the points are read from.
+
+</details>
+
 #### PACEtomo_targetsFromMontage.py [v1.10]
 The targets file is no longer lost when the Navigator contains bad items, and groups spread over several map sections are reported instead of being mis-cropped.
 <details>
