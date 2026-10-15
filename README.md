@@ -404,6 +404,16 @@ If you could not resolve the issue yourself or you encountered a bug, please rep
 
 ## Recent changes
 
+### 15.10.2026
+#### PACEtomo.py [v1.9.3]
+Fixed the `switchAli` re-anchor at the first branch switch.
+<details>
+<summary>Changes</summary>
+
+- At the first branch switch, `reanchorTrackingAtSwitch` tilts back to the `startTilt` and takes a View image to re-anchor the tracking target. It did not set the image shift first, so the View was taken with the image shift left over from the **last data target of the previous branch** (the target loop in `Tilt()` ends there) instead of the tracking target's position. With several targets per group this puts the View outside the tracking area, the alignment becomes unreliable, and the resulting (wrong) correction was then propagated to every target on both branches — a large alignment error. The image shift is now set to the tracking target's setpoint of that branch (its `startTilt` value) before the View is taken.
+
+</details>
+
 ### 30.09.2026
 #### PACEtomo.py [v1.9.3]
 Fully automatic runs: run the scripts from disk instead of pasting them.

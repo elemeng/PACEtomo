@@ -7,7 +7,8 @@
 # Author:       Fabian Eisenstein
 # Created:      2021/04/16
 # Revision:     v1.9.3
-# Last Change:  2026/09/30: tiltToBreaks now logs the splitting of a large tilt swing (header line plus one line per segment), so the split is visible in the log - the tilt angles of the series (e.g. 48/51/-48/-51 degrees) are not limited by swingBreakAngle, only the stage move is
+# Last Change:  2026/10/15: fixed the switchAli re-anchor taking the View at the start tilt with the image shift left over from the last data target of the previous branch (reanchorTrackingAtSwitch did not set the image shift before the View), which put the View off the tracking area and produced a large, then propagated, alignment error
+#               2026/09/30: tiltToBreaks now logs the splitting of a large tilt swing (header line plus one line per segment), so the split is visible in the log - the tilt angles of the series (e.g. 48/51/-48/-51 degrees) are not limited by swingBreakAngle, only the stage move is
 #               2026/09/30: realignToItem now selects the realignment method in the recovery path as well (it previously always used SerialEM's RealignToItem there, so False did not mean "no RealignToItem"); setting description updated (RealignToItem moves the stage Z, the script's own realignment only moves X/Y)
 #               2026/09/30: fixed a crash at the first dewar refill / FEG flash: the Python module's ReportMinuteTime takes NO argument (assigning the value to a named persistent variable is a feature of the SerialEM script language, not of the Python wrapper), so the flash and refinement times are now stored with SetPersistentVar (helper storeMinuteTime); all sem.* calls of the scripts were audited against the module's command list afterwards
 #               2026/09/28: FEG safety rules for the ZLP refinement (it is never run during dewar refills and never while/right after a FEG flash: new fegSettleTime setting, flash times tracked in the persistent variable PACEfegTime); the refinement is skipped with a warning when the energy filter slit is retracted (ReportEnergyFilter); checkColdFEG flashes on the interval itself and no longer calls LongOperation('FF', -1), which only stamped SerialEM's flash time without flashing
@@ -848,6 +849,7 @@ def reanchorTrackingAtSwitch(switchTilt, pn):
         return
     log("Re-anchoring tracking target at the first branch switch...", style=1)
     sem.TiltTo(startTilt)                                                                       # small move back to the start tilt
+    sem.SetImageShift(position[0][pn]["ISXset"], position[0][pn]["ISYset"])                     # the image shift is still at the last data target of the previous branch; start from the tracking setpoint of this branch (its startTilt value), otherwise the View is taken off the tracking area and the alignment is unreliable
     if "viewfile" in target.keys():
         sem.ReadOtherFile(0, "O", target["viewfile"])                                           # reads view file for first AlignTo instead
         sem.V()
