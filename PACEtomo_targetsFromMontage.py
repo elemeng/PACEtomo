@@ -3,8 +3,16 @@
 #ScriptName     PACEtomo_targetsFromMontage
 # Author:       Fabian Eisenstein
 # Created:      2022/12/09
-# Revision:     v1.9
-# Last Change:  2026/09/18: virtual maps are cropped to EXACTLY the dimensions and pixel size of the real low-dose View and
+# Revision:     v1.10
+# Last Change:  2026/10/15: the targets file is now written BEFORE the Navigator is updated, and updating the Navigator
+#               is no longer fatal: SerialEM refuses to read a Navigator file when any of its items refers to a map file
+#               that cannot be found or opened (reported as "N items could not be read in from Navigator file ... gave an
+#               error getting the data"), which used to abort the script after the maps had already been made and left no
+#               targets file; added a check that all points of the group are on the map that gets loaded, since
+#               GetNavGroupImageCoords only returns the points inside that image (points added on other maps, e.g. on
+#               sections 2/3/4 of a multi-section View map, were silently dropped and mis-placed the crops or crashed
+#               with an IndexError)
+#               2026/09/18: virtual maps are cropped to EXACTLY the dimensions and pixel size of the real low-dose View and
 #               Record template images (previously the template pixel size was divided by the binning again and the crop was
 #               sized from the camera properties, so the maps had a wrong scale and did not match live images; e.g. K3 bin 8
 #               gave 720x511 at the wrong pixel size vs 720x508 live, which made SerialEM's alignment/map matching fail or stall)
@@ -270,13 +278,30 @@ image = np.asarray(sem.bufferImage(buffer), dtype=float)
 # Get point coords
 
 sem.GetNavGroupStageCoords(groupID, "groupStageX", "groupStageY", "groupStageZ")
-sem.GetNavGroupImageCoords(groupID, buffer, "groupImageX", "groupImageY")
 
 groupStageX = np.array(sem.GetVariable("groupStageX").split(), dtype=float)
 groupStageY = np.array(sem.GetVariable("groupStageY").split(), dtype=float)
 stageZ = np.array(sem.GetVariable("groupStageZ").split(), dtype=float)[0]
-groupImageX = np.array(sem.GetVariable("groupImageX").split(), dtype=float)
-groupImageY = np.array(sem.GetVariable("groupImageY").split(), dtype=float)
+
+# SerialEM places the group's points in the loaded map image and returns only the ones that lie within it, so a group
+# whose points were added on more than one map (e.g. on several sections of a multi-section view map) comes back short.
+
+try:
+    sem.GetNavGroupImageCoords(groupID, buffer, "groupImageX", "groupImageY")
+    groupImageX = np.array(sem.GetVariable("groupImageX").split(), dtype=float)
+    groupImageY = np.array(sem.GetVariable("groupImageY").split(), dtype=float)
+except Exception:
+    groupImageX = np.array([])
+    groupImageY = np.array([])
+
+if groupImageX.size != groupStageX.size or groupImageY.size != groupStageY.size:
+    sem.Echo("ERROR: Only " + str(groupImageX.size) + " of the " + str(groupStageX.size) + " points of this group could be placed on the map that was loaded (Navigator item " + str(drawnID) + ").")
+    sem.Echo("ERROR: All points of a group have to be added on the same map, i.e. on the same section of the same file. Points added on other maps or on other sections of a multi-section image cannot be cropped.")
+    sem.Echo("ERROR: Please add the targets of this group on one map, or split them into one group per map.")
+    if sem.ReportIfNavAcquiring()[0]:
+        sem.SkipAcquiringNavItem()
+        sem.EndAcquireAtItems()
+    sem.Exit()
 
 # Calculate field of view
 # The virtual maps get EXACTLY the dimensions and pixel size of the template images: the montage is cropped
@@ -419,17 +444,26 @@ for i, tgt in enumerate(targets):
 
     navItems.append(viewItem)
 
-# Write nav file
-
-sem.SaveNavigator(navFile + "~")        # backup unaltered nav file
-WriteNav(navHeader, navItems, navFile)
-sem.ReadNavFile(navFile)
-
-sem.Echo("Updated navigator file with target maps.")
-
 # Write tgts file
 
+# The maps and the targets file are the result of this script and are written first, because updating the Navigator can
+# fail for reasons that have nothing to do with this run: SerialEM refuses to read a Navigator file when any of its
+# items refers to a map file that cannot be found or opened (e.g. items of an earlier run whose maps were moved).
+
 WriteTargets(tgtsFilePath, targets)
+
+# Write nav file
+
+try:
+    sem.SaveNavigator(navFile + "~")        # backup unaltered nav file
+    WriteNav(navHeader, navItems, navFile)
+    sem.ReadNavFile(navFile)
+    sem.Echo("Updated navigator file with target maps.")
+except Exception as e:
+    sem.Echo("WARNING: Updating the navigator file failed: " + str(e))
+    sem.Echo("WARNING: SerialEM does not read a Navigator file when one of its items refers to a map file that cannot be found or opened. Remove the reported items (or move their map files into the folder of the current Navigator file) and reload the Navigator file.")
+    sem.Echo("NOTE: The maps and the targets file were already written: " + tgtsFilePath)
+    sem.Echo("NOTE: The Navigator in memory was not updated and the Navigator file on disk may be incomplete; its previous content is in " + navFile + "~")
 
 sem.Echo("Target selection completed! " + str(len(targets)) + " targets were selected.")
 

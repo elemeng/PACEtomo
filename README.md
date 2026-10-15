@@ -414,6 +414,15 @@ Fixed the `switchAli` re-anchor at the first branch switch.
 
 </details>
 
+#### PACEtomo_targetsFromMontage.py [v1.10]
+The targets file is no longer lost when the Navigator contains bad items, and groups spread over several map sections are reported instead of being mis-cropped.
+<details>
+<summary>Changes</summary>
+
+- The cropped maps and the targets file are now written **before** the Navigator is updated, and updating the Navigator is wrapped so that a failure there cannot cost the run. SerialEM refuses to read a Navigator file when *any* of its items refers to a map file that cannot be found or opened — reported as `N items could not be read in from Navigator file: N items gave an error getting the data` (per-item details with `SetDebugOutput n`) — and the script died on exactly that read (`sem.ReadNavFile`) after all maps had been made and produced no `_tgts.txt`, even when the offending items had nothing to do with the current targets. The message for that case now names the cause, states that the maps and the targets file were written anyway, and points at the backup of the previous Navigator file (`<navfile>~`).
+- Added a check that all points of the group lie on the map that is loaded (`NavIndexItemDrawnOn` + `LoadOtherMap` load one map, i.e. one section). SerialEM's `GetNavGroupImageCoords` returns the image coordinates only of the points **inside that image** — every map item carries a `MapSection`, so points added on sections 2, 3, 4 of a multi-section view map are not returned — while the crops were still indexed by the position within the group. That mis-assigned the crops of the following points (the files were written at the wrong place) or crashed with an `IndexError`. The script now stops with an explicit error giving the number of points that could not be placed, and asks for one map per group.
+- Consequence for multi-section view maps: add all points of a group on a single section, or use one group per section.
+
 ### 30.09.2026
 #### PACEtomo.py [v1.9.3]
 Fully automatic runs: run the scripts from disk instead of pasting them.
