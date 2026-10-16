@@ -94,7 +94,7 @@ extendedMdoc    = True      # saves additional info to .mdoc file
 
 # Hardware settings
 slowTilt        = True     # do backlash step for all tilt angles, on bad stages large tilt steps are less accurate
-swingBreakAngle = 30        # maximum stage tilt movement [degrees] in one swing between exposures; larger swings are split into intermediate moves (no images taken in between) to reduce off-target caused by large tilt moves, 0 disables splitting
+swingBreakAngle = 0        # maximum stage tilt movement [degrees] in one swing between exposures; larger swings are split into intermediate moves (no images taken in between) to reduce off-target caused by large tilt moves, 0 disables splitting
 taOffsetPos     = 0         # additional tilt axis offset values [microns] applied to calculations for positive and...
 taOffsetNeg     = 0         # ...negative branch of the tilt series (possibly useful for side-entry holder systems)
 checkDewar      = True      # check if dewars are refilling before every acquisition
