@@ -414,6 +414,17 @@ Fixed the `switchAli` re-anchor at the first branch switch.
 
 </details>
 
+#### PACEtomo_targetsFromMontage.py [v1.18]
+Many groups can now be prepared in one *Acquire at Items* pass.
+<details>
+<summary>Changes</summary>
+
+- New setting **`markGroupFirstPoints`**: when it is on, the script only **marks the first point of every Navigator group for acquisition** (and clears the other points of those groups), saves the Navigator and stops. That was the missing step for preparing many groups at once: with one marked point per group, a single **Acquire at Items** pass with this script as the per-item script (and *Skip stage move to item if possible* checked, plus `noUI = True` so the file names come from the montage labels) prepares every group in turn. Groups whose first item is not a point are skipped, because the script has to be run on a point — it is the tracking point that is kept at the top of its group.
+- In a batch run (`noUI`) the script now also **hands the acquisition flag over**: the point it ran at is cleared and target 1's map — which carries the note pointing at the targets file — stays marked, so the *next* Acquire at Items pass runs the acquisition at the groups that are ready. Interactive runs leave the flags alone. (The map entries added during a batch are appended after the end of the range SerialEM is acquiring, so they are not acquired by the running pass.)
+- The version reported in the log is v1.18.
+
+</details>
+
 #### PACEtomo_targetsFromMontage.py [v1.17]
 In the live mode the Navigator map entries are made by SerialEM as well, so the hand-written entry machinery is not used.
 <details>

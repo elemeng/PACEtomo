@@ -3,8 +3,12 @@
 #ScriptName     PACEtomo_targetsFromMontage
 # Author:       Fabian Eisenstein
 # Created:      2022/12/09
-# Revision:     v1.17
-# Last Change:  2026/10/16: in the liveReferences mode the Navigator map entries are now made by SERIALEM too, with
+# Revision:     v1.18
+# Last Change:  2026/10/16: added markGroupFirstPoints so that many groups can be prepared in ONE Acquire at Items pass:
+#               it marks the first point of every Navigator group for acquisition (and clears the other points of those
+#               groups) and then stops, and in a batch run (noUI) the script moves the Acquire flag from that point on
+#               to the map of target 1, which is what the next Acquire at Items pass runs the acquisition at.
+#               2026/10/16: in the liveReferences mode the Navigator map entries are now made by SERIALEM too, with
 #               NewMap called while the reference file is still open (so the entry is built by SerialEM with its own
 #               keys and points at the file it wrote), followed by ChangeItemLabel, ChangeItemNote and SetItemAcquire.
 #               The hand-written Navigator file machinery (parsing the file, building entries from the templates,
@@ -86,13 +90,16 @@
 ##### SETTINGS #####
 
 onlyView = False    # set to True to only create View maps and not Preview maps and targets file
+markGroupFirstPoints = False   # set to True to only mark the first point of every Navigator group for acquisition
+                    # (and clear the other points of those groups) and then stop, so that ONE Acquire at Items pass
+                    # with this script as the per-item script prepares all groups at once
 noUI    = False     # set to True to avoid folder/name selection (e.g. to run the script in a Acquire at Items routine), it will use the label of the montage as name template
 prefix  = "pos"     # prefix for name when running noUI
 liveReferences = True      # True: take a real View and Preview image at every point and use them as the references of
                     # that target (like PACEtomo_selectTargets), re-aligning to the point in the map first. The
                     # references then contain the resolution of the live images instead of the map, at the cost of one
                     # View and one Preview exposure per point. False: crop the references out of the montage map.
-scriptVersion = "v1.17 (2026/10/16)"    # reported at the start of a run, so the file that actually ran is identifiable
+scriptVersion = "v1.18 (2026/10/16)"    # reported at the start of a run, so the file that actually ran is identifiable
 refAlignTol = 0.05  # target position tolerance [microns] of the re-alignment in the liveReferences mode; the target is
                     # re-aligned with the image shift until it is centred within this distance
 
@@ -312,6 +319,28 @@ def FindOffsetInImage(mapImage, mapCoords, mapPixSize, image, pixSize):
         return None, None, quality, sharpness
     return dy, dx, quality, sharpness
 
+def GroupLeaderPoints(navItems):
+    # The first point of every Navigator group, in table order, from a parsed Navigator file, together with the table
+    # indices of the items belonging to each group. A group whose first item is not a point is left out, because the
+    # script has to be run on a point (the tracking point is kept at the top of its group).
+    # Returns (leaders, members), leaders = [(group ID, table index, label, stage X, stage Y), ...],
+    # members = {group ID: [table indices]}.
+    leaders, members, firstType = [], {}, {}
+    for index, item in enumerate(navItems, start=1):
+        if "GroupID" not in item:
+            continue
+        groupID = int(item["GroupID"][0])
+        if groupID == 0:
+            continue                      # 0 means: not in a group
+        members.setdefault(groupID, []).append(index)
+        if groupID in firstType:
+            continue
+        firstType[groupID] = item.get("Type", ["-1"])[0]
+        if firstType[groupID] == "0":
+            stage = item.get("StageXYZ", ["0", "0", "0"])
+            leaders.append((groupID, index, item.get("Item", ""), stage[0], stage[1]))
+    return leaders, members
+
 def GroupItemsFromNav(navItems, groupID, stageX, stageY):
     # Points of a group and the map each of them was added on, from a parsed Navigator file, in table order.
     # Returns (points, maps) with points = [(table index, item), ...] and maps = {map ID: table index}; or
@@ -488,6 +517,41 @@ if onlyView:
     WriteLog("NOTE: Running in View-only mode: Only View maps will be created. Please change the setting in the script if you want to create Preview maps as well.")
 
 WriteLog("NOTE: PACEtomo_targetsFromMontage, Revision " + scriptVersion + ". If this line does not show the version you expect, the script that ran is not this file.")
+
+if markGroupFirstPoints:
+    # Mark the first point of every group for acquisition, so that a single Acquire at Items pass can prepare all
+    # groups: the script then runs once per group and moves the Acquire flag on to the map of target 1 (see below).
+
+    WriteLog("NOTE: markGroupFirstPoints is on: marking the first point of every group for acquisition.")
+    try:
+        markNavFile = sem.ReportNavFile()
+    except Exception as e:
+        WriteLog("ERROR: There is no Navigator file defined (" + str(e) + "); save the Navigator first (Navigator - Save).")
+        sem.Exit()
+    markHeader, markItems = ParseNav(markNavFile)
+    markLeaders, markMembers = GroupLeaderPoints(markItems)
+    if len(markLeaders) == 0:
+        WriteLog("WARNING: No groups were found in " + markNavFile + ".")
+    for groupID, index, label, stageX, stageY in markLeaders:
+        try:
+            sem.SetItemAcquire(index, 1)
+            WriteLog("NOTE: Group " + str(groupID) + ": point " + str(label) + " at stage " + str(stageX) + ", " + str(stageY) + " is marked for acquisition.")
+        except Exception as e:
+            WriteLog("WARNING: The point " + str(label) + " of group " + str(groupID) + " could not be marked (" + str(e) + ").")
+        for index in markMembers[groupID]:
+            if index != markMembers[groupID][0]:
+                try:
+                    sem.SetItemAcquire(index, 0)
+                except Exception:
+                    pass
+    WriteLog("NOTE: " + str(len(markLeaders)) + " group(s) marked; the other points of those groups are cleared.")
+    WriteLog("NOTE: Now run Acquire at Items with this script as the per-item script and 'Skip stage move to item if possible' checked.")
+    try:
+        sem.SaveNavigator()
+        WriteLog("NOTE: The Navigator file was saved.")
+    except Exception as e:
+        WriteLog("WARNING: Saving the Navigator file failed: " + str(e) + "; save it by hand.")
+    sem.Exit()
 
 # Get nav item info
 
@@ -1038,6 +1102,17 @@ if stageBefore is not None:
 # items refers to a map file that cannot be found or opened (e.g. items of an earlier run whose maps were moved).
 
 WriteTargets(tgtsFilePath, targets)
+
+if noUI and navID > 0:
+    # In a batch (noUI) the script was run at the point that markGroupFirstPoints marked to start this group. That
+    # point is prepared now, so the Acquire flag moves on to the map of target 1: the next Acquire at Items pass can
+    # then run the acquisition at the groups that are ready.
+
+    try:
+        sem.SetItemAcquire(navID, 0)
+        WriteLog("NOTE: The Acquire flag was moved from this point to the map of target 1, so the next Acquire at Items pass runs the acquisition.")
+    except Exception as e:
+        WriteLog("WARNING: The Acquire flag of the point this script ran on could not be cleared (" + str(e) + "); clear it by hand so that the point is not acquired again.")
 
 if nativeItems:
     # The map entries of the references are already in the Navigator, made by SerialEM, so the file only has to be
