@@ -3,8 +3,29 @@
 #ScriptName     PACEtomo_targetsFromMontage
 # Author:       Fabian Eisenstein
 # Created:      2022/12/09
-# Revision:     v1.14
-# Last Change:  2026/10/16: fixed the reason why the Navigator items of this script could not be read back: MapBinning
+# Revision:     v1.17
+# Last Change:  2026/10/16: in the liveReferences mode the Navigator map entries are now made by SERIALEM too, with
+#               NewMap called while the reference file is still open (so the entry is built by SerialEM with its own
+#               keys and points at the file it wrote), followed by ChangeItemLabel, ChangeItemNote and SetItemAcquire.
+#               The hand-written Navigator file machinery (parsing the file, building entries from the templates,
+#               rewriting and merging) is then not used at all and the file is only saved, so no unreadable item
+#               anywhere in the Navigator can keep the reference maps out of it. The crop mode still uses the old
+#               machinery, and both fall back with a warning if NewMap cannot be used (images outside buffer A).
+#               2026/10/16: in the liveReferences mode the View and Preview images are now saved BY SERIALEM (OpenNewFile
+#               with the exact name, which bypasses the file properties dialog, then Save and CloseFile) instead of being
+#               read out of the buffer and written with mrcfile. The reference files are then exactly like images taken by
+#               the camera: SerialEM's own MRC header with the camera values, pixel size, exposure, intensity and its
+#               extended header. The image that the script keeps in memory is still used for the map entries and as a
+#               fallback if the save fails, and the best aligned image is only saved by SerialEM when it is the one still
+#               in the buffer; otherwise it falls back to writing that image directly.
+#               2026/10/16: the cropped reference images no longer look dim. SerialEM loads maps converted to bytes for
+#               display ("Convert Maps to Bytes", on by default), so the image the script reads from the buffer has a
+#               range of 0..255 while the file holds the values written by the camera (0..12576 in the session that was
+#               checked), and a reference made from it looked dim. The crops are now scaled onto the value range stored
+#               in the map file, so they have the same values and clip like an image taken by the camera. The
+#               liveReferences mode does not need this, since it takes live images. The version reported in the log is
+#               now taken from one place (scriptVersion) instead of a string that had gone stale.
+#               2026/10/16: fixed the reason why the Navigator items of this script could not be read back: MapBinning
 #               was written as "2.0" where SerialEM requires an integer (the binning comes back as a float from
 #               ImageProperties and is multiplied by the binFactor for Gatan cameras), so the reader reported every
 #               item of the run as "gave an error getting the data" and the reference maps could not be used. Both the
@@ -71,6 +92,7 @@ liveReferences = True      # True: take a real View and Preview image at every p
                     # that target (like PACEtomo_selectTargets), re-aligning to the point in the map first. The
                     # references then contain the resolution of the live images instead of the map, at the cost of one
                     # View and one Preview exposure per point. False: crop the references out of the montage map.
+scriptVersion = "v1.17 (2026/10/16)"    # reported at the start of a run, so the file that actually ran is identifiable
 refAlignTol = 0.05  # target position tolerance [microns] of the re-alignment in the liveReferences mode; the target is
                     # re-aligned with the image shift until it is centred within this distance
 
@@ -146,6 +168,29 @@ def ParseNav(navFile):
     if "Item" in newItem.keys():    #append last target
         items.append(newItem)
     return header, items
+
+def MapFilePath(navItems, mapIndex):
+    # Path of the MRC file of the map at the given table index, or None. The Navigator file separates values by
+    # spaces, so a path containing spaces arrives as several words and has to be joined again.
+    if not (0 < mapIndex <= len(navItems)):
+        return None
+    item = navItems[mapIndex - 1]
+    if "MapFile" not in item or len(item["MapFile"]) == 0:
+        return None
+    return " ".join(item["MapFile"])
+
+def ReadMrcRange(filename):
+    # The value range (dmin, dmax) stored in an MRC file, or None. Reads only the header.
+    if filename is None:
+        return None
+    try:
+        with mrcfile.open(filename, header_only=True, permissive=True) as mrc:
+            low, high = float(mrc.header.dmin), float(mrc.header.dmax)
+        if high > low:
+            return low, high
+    except Exception:
+        pass
+    return None
 
 def NavValue(val):
     # Values of some keys have to be integers (e.g. MapBinning, MapMagInd, MapSection): SerialEM reports the whole item
@@ -304,6 +349,79 @@ def PointImageCoords(itemIndex, buf):
     except (TypeError, ValueError):
         return None
 
+def SaveAndMapReference(path, buf, label, note, acquire=False):
+    # Save the image in the buffer with SerialEM and turn it into a labelled Navigator map in one go, so that the file
+    # AND the map entry are made by SerialEM itself (with its own keys: MapBinning, MapScaleMat, MapWidthHeight,
+    # MapMinMaxScale, the magnification and so on, and pointing at the file that was just written). The file
+    # properties dialog is bypassed by OpenNewFile; NewMap has to be called while the file is still open, because the
+    # image has to be "saved already, or savable in the current file", and it maps the image in buffer A. Returns
+    # (filename that was written, index of the new item) with either of them None if that part failed.
+    if buf != "A":
+        return None, None                 # NewMap always uses buffer A: the crops are written by the script instead
+    written, itemIndex = None, None
+    try:
+        sem.OpenNewFile(path)
+        sem.S(buf)
+        written = sem.ReportCurrentFilename()
+        itemIndex = sem.NewMap()
+        sem.CloseFile()
+    except Exception as e:
+        WriteLog("WARNING: Saving " + os.path.basename(path) + " and making its Navigator map failed (" + str(e) + ").")
+        try:
+            sem.CloseFile()
+        except Exception:
+            pass
+        return written, None
+    if isinstance(written, (list, tuple)):
+        written = written[0] if len(written) > 0 else None
+    if isinstance(itemIndex, (list, tuple)):
+        itemIndex = itemIndex[0] if len(itemIndex) > 0 else None
+    if isinstance(written, str) and len(written) > 0 and os.path.abspath(written) != os.path.abspath(path):
+        WriteLog("NOTE: SerialEM wrote " + os.path.basename(written) + " instead of " + os.path.basename(path) + "; the targets file uses that name.")
+    if itemIndex is not None:
+        try:
+            sem.ChangeItemLabel(int(itemIndex), label)
+            sem.ChangeItemNote(int(itemIndex), note)
+            if acquire:
+                sem.SetItemAcquire(int(itemIndex), 1)
+        except Exception as e:
+            WriteLog("WARNING: The label, note or Acquire flag of the new map (item " + str(itemIndex) + ") could not be set (" + str(e) + "); set them by hand: label " + label + ", note " + note + ".")
+    return written, itemIndex
+
+def SaveBufferWithSerialEM(path, buf):
+    # Save the image in the buffer with SerialEM itself and return the name of the file that was written, or None if
+    # it failed. The file is then exactly like an image taken by the camera: SerialEM's own MRC header with the camera
+    # values, the pixel size, the exposure and intensity, and its extended header. OpenNewFile uses the name as given
+    # and bypasses the file properties dialog; if SerialEM modified the name, the file (and its metadata file) is
+    # renamed to the intended name, which is what the targets file and the Navigator entries refer to.
+    try:
+        sem.OpenNewFile(path)
+        sem.S(buf)
+        written = sem.ReportCurrentFilename()
+        sem.CloseFile()
+    except Exception as e:
+        WriteLog("WARNING: Saving " + os.path.basename(path) + " with SerialEM failed (" + str(e) + "); writing it directly instead.")
+        try:
+            sem.CloseFile()
+        except Exception:
+            pass
+        return None
+    if isinstance(written, (list, tuple)):
+        written = written[0] if len(written) > 0 else ""
+    if not isinstance(written, str) or len(written) == 0:
+        return path
+    if os.path.abspath(written) == os.path.abspath(path):
+        return path
+    try:
+        os.replace(written, path)
+        if os.path.exists(written + ".mdoc"):
+            os.replace(written + ".mdoc", path + ".mdoc")
+        WriteLog("NOTE: SerialEM wrote " + os.path.basename(written) + "; renamed it to " + os.path.basename(path) + ".")
+        return path
+    except Exception as e:
+        WriteLog("WARNING: The file " + written + " could not be renamed to " + path + " (" + str(e) + "); the targets file and the Navigator entries expect the name " + path + ".")
+        return written
+
 def OffsetToStage(dy, dx, buf):
     # Stage shift [microns] that moves the image content by (dy, dx) pixels, using SerialEM's image to stage
     # transformation for the image in the buffer (image coordinates have Y from the top, as in SerialEM's commands).
@@ -369,7 +487,7 @@ if sem.ReportProperty("DummyInstance") == 1:
 if onlyView:
     WriteLog("NOTE: Running in View-only mode: Only View maps will be created. Please change the setting in the script if you want to create Preview maps as well.")
 
-WriteLog("NOTE: PACEtomo_targetsFromMontage, Revision v1.11 (2026/10/15). If this line does not show the version you expect, the script that ran is not this file.")
+WriteLog("NOTE: PACEtomo_targetsFromMontage, Revision " + scriptVersion + ". If this line does not show the version you expect, the script that ran is not this file.")
 
 # Get nav item info
 
@@ -605,10 +723,19 @@ tgtImages = []
 viewImages = []
 targets = []
 alignSign = 1                # direction of the image shift correction, inverted if a correction does not improve
+viewName, previewName = None, None    # names of the reference files as they were written
+mapRange = None              # value range of the map file, for the byte-converted images from the display buffer
 stageBefore = None
 loadedMapID = None
+nativeItems = False
+if liveReferences and not dummy and buffer == "A":
+    nativeItems = True                   # SerialEM saves the images and makes the map entries itself
 if liveReferences and not dummy:
-    WriteLog("NOTE: MODE: liveReferences - taking a View and a Preview image at every point and re-aligning to the point in the map first.")
+    WriteLog("NOTE: MODE: liveReferences - taking a View and a Preview image at every point and re-aligning to the point in the map.")
+    if nativeItems:
+        WriteLog("NOTE: The View and Preview images will be saved by SerialEM and turned into map entries by it (NewMap), so the entries have SerialEM's own keys and point at the files it wrote.")
+    else:
+        WriteLog("WARNING: The images are not in buffer A (they are in buffer " + str(buffer) + "), so SerialEM cannot make the map entries from them; the entries are built by the script as before.")
 elif liveReferences:
     WriteLog("WARNING: MODE: liveReferences is on, but SerialEM runs in DUMMY mode, where there is no live image to take. The reference images are therefore CROPPED out of the map, exactly as with liveReferences = False. The rest of the script (targets file, navigator items) still runs; to get real View and Preview references, run the script on the microscope.")
 if not liveReferences:
@@ -682,6 +809,20 @@ for i in range(groupStageX.size):
             sem.ImageShiftByStageDiff(alignSign * moveX, alignSign * moveY)
             shifted = True
 
+        # Save the View image with SerialEM while it is still in the buffer (the last one taken is the re-aligned one)
+
+        viewSaved, viewItemIndex, viewName = None, None, None
+        viewFileName = userName + "_tgt_" + str(i + 1).zfill(3) + "_view.mrc"
+        if viewRef is not None and viewRef is attemptImage and nativeItems:
+            viewWritten, viewItemIndex = SaveAndMapReference(os.path.join(curDir, viewFileName), buffer, "v" + str(i + 1).zfill(2), viewFileName)
+            if viewWritten is not None:
+                viewSaved, viewName = viewWritten, os.path.basename(viewWritten)
+        elif viewRef is not None and viewRef is attemptImage:
+            viewSaved = SaveBufferWithSerialEM(os.path.join(curDir, viewFileName), buffer)
+            viewName = os.path.basename(viewSaved) if viewSaved is not None else None
+        elif viewRef is not None:
+            WriteLog("WARNING: The best aligned View image of point " + str(i + 1) + " was not the last one taken, so it is written directly instead of being saved by SerialEM.")
+
         if not onlyView:
             for attempt in range(2):
                 sem.L()
@@ -705,6 +846,19 @@ for i in range(groupStageX.size):
                 sem.ImageShiftByStageDiff(alignSign * moveX, alignSign * moveY)
                 shifted = True
 
+        previewSaved, previewItemIndex, previewName = None, None, None
+        previewFileName = userName + "_tgt_" + str(i + 1).zfill(3) + ".mrc"
+        previewNote = (userName + "_tgts.txt") if i == 0 else previewFileName
+        if previewRef is not None and previewRef is attemptImage and nativeItems:
+            previewWritten, previewItemIndex = SaveAndMapReference(os.path.join(curDir, previewFileName), buffer, str(i + 1).zfill(3), previewNote, acquire=(i == 0))
+            if previewWritten is not None:
+                previewSaved, previewName = previewWritten, os.path.basename(previewWritten)
+        elif previewRef is not None and previewRef is attemptImage:
+            previewSaved = SaveBufferWithSerialEM(os.path.join(curDir, previewFileName), buffer)
+            previewName = os.path.basename(previewSaved) if previewSaved is not None else None
+        elif previewRef is not None:
+            WriteLog("WARNING: The best aligned Preview image of point " + str(i + 1) + " was not the last one taken, so it is written directly instead of being saved by SerialEM.")
+
         if shifted:
             sem.ResetImageShift()       # reset the image shift, moving the stage to compensate, so that the field stays put
 
@@ -713,13 +867,15 @@ for i in range(groupStageX.size):
         else:
             viewImageProc = np.flip(viewRef, axis=0).astype(np.float32)
             viewImages.append(viewImageProc)
-            WriteMrc(userName + "_tgt_" + str(i + 1).zfill(3) + "_view.mrc", viewImageProc, viewRefPix)
+            if viewSaved is None:
+                WriteMrc(userName + "_tgt_" + str(i + 1).zfill(3) + "_view.mrc", viewImageProc, viewRefPix)
             if viewRef.shape != (viewSizeY, viewSizeX) or abs(viewRefPix - viewPixSize) > 0.01:
                 WriteLog("WARNING: The View image of point " + str(i + 1) + " is " + str(viewRef.shape[1]) + "x" + str(viewRef.shape[0]) + " at " + str(round(viewRefPix, 2)) + " A/px, but the View template has " + str(viewSizeX) + "x" + str(viewSizeY) + " at " + str(round(viewPixSize, 2)) + " A/px; check the low dose View settings.")
             if not onlyView and previewRef is not None:
                 tgtImageProc = np.flip(previewRef, axis=0).astype(np.float32)
                 tgtImages.append(tgtImageProc)
-                WriteMrc(userName + "_tgt_" + str(i + 1).zfill(3) + ".mrc", tgtImageProc, previewRefPix)
+                if previewSaved is None:
+                    WriteMrc(userName + "_tgt_" + str(i + 1).zfill(3) + ".mrc", tgtImageProc, previewRefPix)
                 if previewRef.shape != (recordSizeY, recordSizeX) or abs(previewRefPix - recordPixSize) > 0.01:
                     WriteLog("WARNING: The Preview image of point " + str(i + 1) + " is " + str(previewRef.shape[1]) + "x" + str(previewRef.shape[0]) + " at " + str(round(previewRefPix, 2)) + " A/px, but the Preview template has " + str(recordSizeX) + "x" + str(recordSizeY) + " at " + str(round(recordPixSize, 2)) + " A/px; check the low dose Preview/Record settings.")
     else:
@@ -733,14 +889,30 @@ for i in range(groupStageX.size):
         if edgeTarget:
             WriteLog("WARNING: Point " + str(i + 1) + " is too close to the edge of the map and its reference images are padded with artificial pixels which can bias the realignment.")
 
+        # SerialEM loads maps converted to bytes for display ("Convert Maps to Bytes", on by default), so the image in the
+        # buffer has a range of 0..255 and not the values that were written to the map file. A reference image made from
+        # it therefore looks dim next to an image SerialEM wrote from the camera (the range in the session that was
+        # checked was 0..255 against 0..12576 in the file). Rescale the reference onto the value range stored in the map
+        # file, so that it has the same values and clips the same way as a camera image.
+
+        if mapRange is None and not dummy:
+            mapIndex = mapItems.get(pointMapID) if groupPoints is not None else drawnID
+            mapRange = ReadMrcRange(MapFilePath(navItems, mapIndex))
+            if mapRange is not None:
+                WriteLog("NOTE: The reference images are scaled to the value range of the map file (" + str(round(mapRange[0], 2)) + " to " + str(round(mapRange[1], 2)) + "), because SerialEM loads maps converted to bytes for display.")
+
         if not onlyView:
             imageCrop = CropImage(image, (pointY, pointX), fovRec)
             imageProc = np.flip(resize(imageCrop, (out_recY, out_recX), preserve_range=True, anti_aliasing=True).astype(np.float32), axis=0)
+            if mapRange is not None:
+                imageProc = (mapRange[0] + imageProc * (mapRange[1] - mapRange[0]) / 255.0).astype(np.float32)
             tgtImages.append(imageProc)
             WriteMrc(userName + "_tgt_" + str(i + 1).zfill(3) + ".mrc", tgtImages[i], recordPixSize)
 
         imageCrop = CropImage(image, (pointY, pointX), fovView)
         viewImageProc = np.flip(resize(imageCrop, (out_viewY, out_viewX), preserve_range=True, anti_aliasing=True).astype(np.float32), axis=0)
+        if mapRange is not None:
+            viewImageProc = (mapRange[0] + viewImageProc * (mapRange[1] - mapRange[0]) / 255.0).astype(np.float32)
         viewImages.append(viewImageProc)
         WriteMrc(userName + "_tgt_" + str(i + 1).zfill(3) + "_view.mrc", viewImageProc, viewPixSize)
 
@@ -749,7 +921,7 @@ for i in range(groupStageX.size):
         if SSX > 15 or SSY > 15:
             WriteLog("WARNING: Point " + str(i + 1) + " requires image shifts (" + str(round(SSX, 1)) + "|" + str(round(SSY, 1)) + ") beyond the default image shift limit (15)!")
         tgt_params = {"tsfile": userName + "_ts_" + str(i + 1).zfill(3) + ".mrc", 
-                    "viewfile": userName + "_tgt_" + str(i + 1).zfill(3) + "_view.mrc", 
+                    "viewfile": viewName if viewName else userName + "_tgt_" + str(i + 1).zfill(3) + "_view.mrc", 
                     "SSX": SSX, 
                     "SSY": SSY, 
                     "stageX": groupStageX[i], 
@@ -757,12 +929,12 @@ for i in range(groupStageX.size):
                     "skip": "False"}
     else:       # leave out SS coords and calculate from stage coords on the fly in PACEtomo.py
         tgt_params = {"tsfile": userName + "_ts_" + str(i + 1).zfill(3) + ".mrc", 
-                    "viewfile": userName + "_tgt_" + str(i + 1).zfill(3) + "_view.mrc", 
+                    "viewfile": viewName if viewName else userName + "_tgt_" + str(i + 1).zfill(3) + "_view.mrc", 
                     "stageX": groupStageX[i], 
                     "stageY": groupStageY[i], 
                     "skip": "False"}
     if not onlyView:
-        tgt_params["tgtfile"] = userName + "_tgt_" + str(i + 1).zfill(3) + ".mrc"
+        tgt_params["tgtfile"] = previewName if previewName else userName + "_tgt_" + str(i + 1).zfill(3) + ".mrc"
     targets.append(tgt_params)
 
 if not onlyView:
@@ -782,47 +954,27 @@ if not onlyView:
 ptsDX_view = np.array(np.array(templateView["PtsX"], dtype=float) - float(templateView["StageXYZ"][0]))
 ptsDY_view = np.array(np.array(templateView["PtsY"], dtype=float) - float(templateView["StageXYZ"][1]))
 
-navItemsExisting = len(navItems)
-WriteLog("NOTE: Adding the maps of the references of every target to the Navigator.")
+if not nativeItems:
+    # The entries are built here by the script only when the live mode could not have SerialEM make them itself.
 
-# Add maps
+    navItemsExisting = len(navItems)
+    WriteLog("NOTE: Adding the maps of the references of every target to the Navigator.")
 
-newNavIDs = []
-for i, tgt in enumerate(targets):
+    # Add maps
+
+    newNavIDs = []
+    for i, tgt in enumerate(targets):
     
-    # Create view map first to get mapID
-    viewItem = copy.deepcopy(templateView)
-    viewItem["Item"] = "v" + str(i + 1).zfill(2)
-    viewItem["StageXYZ"] = [tgt["stageX"], tgt["stageY"], stageZ]
-    viewItem["PtsX"] = ptsDX_view + tgt["stageX"]
-    viewItem["PtsY"] = ptsDY_view + tgt["stageY"]
-    viewItem["MapFile"] = [os.path.join(curDir, tgt["viewfile"])]
-    viewItem["Note"] = [tgt["viewfile"]]
-    viewItem["MapBinning"] = [int(viewBinning * binFactor)]        # an integer key: a float such as 2.0 makes the whole item unreadable
-    viewItem["MapMinMaxScale"] = [np.min(viewImages[i]), np.max(viewImages[i])]
-
-    # Create new map ID
-    uniqueID = int(sem.GetUniqueNavID())
-    while uniqueID in newNavIDs:
-        uniqueID = int(sem.GetUniqueNavID())
-    newNavIDs.append(uniqueID)
-
-    newViewID = uniqueID
-
-    viewItem["MapID"] = [newViewID]
-    viewItem["RealignedID"] = [drawnID]
-    viewItem["SamePosId"] = [newViewID]
-
-    if not onlyView:
-        # Create target map
-        tgtItem = copy.deepcopy(templatePrev)
-        tgtItem["Item"] = str(i + 1).zfill(3)
-        tgtItem["StageXYZ"] = [tgt["stageX"], tgt["stageY"], stageZ]
-        tgtItem["PtsX"] = ptsDX_rec + tgt["stageX"]
-        tgtItem["PtsY"] = ptsDY_rec + tgt["stageY"]
-        tgtItem["MapFile"] = [os.path.join(curDir, tgt["tgtfile"])]
-        tgtItem["MapBinning"] = [int(recordBinning * binFactor)]    # an integer key, see above
-        tgtItem["MapMinMaxScale"] = [np.min(tgtImages[i]), np.max(tgtImages[i])]
+        # Create view map first to get mapID
+        viewItem = copy.deepcopy(templateView)
+        viewItem["Item"] = "v" + str(i + 1).zfill(2)
+        viewItem["StageXYZ"] = [tgt["stageX"], tgt["stageY"], stageZ]
+        viewItem["PtsX"] = ptsDX_view + tgt["stageX"]
+        viewItem["PtsY"] = ptsDY_view + tgt["stageY"]
+        viewItem["MapFile"] = [os.path.join(curDir, tgt["viewfile"])]
+        viewItem["Note"] = [tgt["viewfile"]]
+        viewItem["MapBinning"] = [int(viewBinning * binFactor)]        # an integer key: a float such as 2.0 makes the whole item unreadable
+        viewItem["MapMinMaxScale"] = [np.min(viewImages[i]), np.max(viewImages[i])]
 
         # Create new map ID
         uniqueID = int(sem.GetUniqueNavID())
@@ -830,27 +982,50 @@ for i, tgt in enumerate(targets):
             uniqueID = int(sem.GetUniqueNavID())
         newNavIDs.append(uniqueID)
 
-        tgtItem["MapID"] = [uniqueID]
-        tgtItem["RealignedID"] = [drawnID]
-        tgtItem["SamePosId"] = [newViewID]
+        newViewID = uniqueID
 
-        if i == 0:
-            tgtItem["Note"] = [userName + "_tgts.txt"]
-            tgtItem["Acquire"] = [1]
+        viewItem["MapID"] = [newViewID]
+        viewItem["RealignedID"] = [drawnID]
+        viewItem["SamePosId"] = [newViewID]
+
+        if not onlyView:
+            # Create target map
+            tgtItem = copy.deepcopy(templatePrev)
+            tgtItem["Item"] = str(i + 1).zfill(3)
+            tgtItem["StageXYZ"] = [tgt["stageX"], tgt["stageY"], stageZ]
+            tgtItem["PtsX"] = ptsDX_rec + tgt["stageX"]
+            tgtItem["PtsY"] = ptsDY_rec + tgt["stageY"]
+            tgtItem["MapFile"] = [os.path.join(curDir, tgt["tgtfile"])]
+            tgtItem["MapBinning"] = [int(recordBinning * binFactor)]    # an integer key, see above
+            tgtItem["MapMinMaxScale"] = [np.min(tgtImages[i]), np.max(tgtImages[i])]
+
+            # Create new map ID
+            uniqueID = int(sem.GetUniqueNavID())
+            while uniqueID in newNavIDs:
+                uniqueID = int(sem.GetUniqueNavID())
+            newNavIDs.append(uniqueID)
+
+            tgtItem["MapID"] = [uniqueID]
+            tgtItem["RealignedID"] = [drawnID]
+            tgtItem["SamePosId"] = [newViewID]
+
+            if i == 0:
+                tgtItem["Note"] = [userName + "_tgts.txt"]
+                tgtItem["Acquire"] = [1]
+            else:
+                tgtItem["Note"] = [tgt["tgtfile"]]
+                tgtItem["Acquire"] = [0]
+
+            navItems.append(tgtItem)
         else:
-            tgtItem["Note"] = [tgt["tgtfile"]]
-            tgtItem["Acquire"] = [0]
+            if i == 0:
+                viewItem["Note"] = [userName + "_tgts.txt"]
+                viewItem["Acquire"] = [1]
+            else:
+                viewItem["Note"] = [tgt["viewfile"]]
+                viewItem["Acquire"] = [0]
 
-        navItems.append(tgtItem)
-    else:
-        if i == 0:
-            viewItem["Note"] = [userName + "_tgts.txt"]
-            viewItem["Acquire"] = [1]
-        else:
-            viewItem["Note"] = [tgt["viewfile"]]
-            viewItem["Acquire"] = [0]
-
-    navItems.append(viewItem)
+        navItems.append(viewItem)
 
 if stageBefore is not None:
     WriteLog("NOTE: Returning to the stage position the script started at.")
@@ -864,59 +1039,72 @@ if stageBefore is not None:
 
 WriteTargets(tgtsFilePath, targets)
 
-# Add the new items to the Navigator
+if nativeItems:
+    # The map entries of the references are already in the Navigator, made by SerialEM, so the file only has to be
+    # saved. Nothing is rewritten and nothing is read back in, so no unreadable item anywhere in the file can keep
+    # these entries out of the Navigator.
 
-# They are NOT added by rewriting the whole Navigator file and reading it back in: SerialEM refuses to read a Navigator
-# file when ANY of its items refers to a map file that cannot be found or opened, and that would keep the reference maps
-# of this run out of the Navigator as well. The new items are written to a separate file and merged instead, because the
-# merge reads only that file, and the Navigator is then saved.
-
-newItemsFile = navFile + ".new"
-newItems = navItems[navItemsExisting:]
-try:
-    sem.SaveNavigator(navFile + "~")                    # backup unaltered nav file
-except Exception as e:
-    WriteLog("WARNING: The backup of the Navigator file could not be written: " + str(e))
-
-merged = False
-try:
-    WriteNav(navHeader, newItems, newItemsFile)
-    sem.MergeNavFile(newItemsFile)
-    sem.SaveNavigator()
-    merged = True
-    WriteLog("NOTE: " + str(len(newItems)) + " items were merged into the Navigator and the Navigator file was saved. The items are also in " + newItemsFile + ".")
     try:
-        os.remove(newItemsFile)
-    except Exception:
-        pass
-except Exception as e:
-    WriteLog("WARNING: Adding the new maps to the Navigator failed: " + str(e))
-    WriteLog("WARNING: The " + str(len(newItems)) + " new items are in " + newItemsFile + " and can be merged by hand with Navigator - Merge File.")
-    WriteLog("WARNING: SerialEM does not read a Navigator file when one of its items refers to a map file that cannot be found or opened; this can be an item of an earlier run or one of the reference files written by this script.")
-    WriteLog("NOTE: The maps and the targets file were written before this step: " + tgtsFilePath)
-    try:
-        WriteNav(navHeader, navItems, navFile)      # fallback: the previous way, all items in the whole file
-        sem.ReadNavFile(navFile)
-        WriteLog("NOTE: The whole Navigator file was written and read back in instead (fallback).")
+        sem.SaveNavigator(navFile + "~")                # backup of the unaltered Navigator file
+        sem.SaveNavigator()
+        WriteLog("NOTE: The Navigator file was saved with the " + str(len(targets)) + " new maps in it.")
     except Exception as e:
-        WriteLog("WARNING: That failed as well: " + str(e))
-    if not dummy:
-        # find out whether the files written by this script are the problem, by reading one of them back with SerialEM
-        checkBuffers = ["A"] if onlyView else ["A", "B"]
-        checkFiles = [userName + "_tgt_001_view.mrc"] if onlyView else [userName + "_tgt_001_view.mrc", userName + "_tgt_001.mrc"]
-        for checkFile, checkBuffer in zip(checkFiles, checkBuffers):
-            try:
-                sem.OpenOldFile(os.path.join(curDir, checkFile))
-                sem.ReadFile(0, checkBuffer)
-                sem.CloseFile()
-                WriteLog("NOTE: Read-back check passed for " + checkFile + ".")
-            except Exception as e:
-                WriteLog("ERROR: SerialEM cannot read back the file written by this script: " + checkFile + " (" + str(e) + ")")
-                WriteLog("ERROR: Navigator items that point to such a file cannot be loaded either; this is what is reported as 'items could not be read in from Navigator file'. Please report this message together with the file.")
-            try:
-                sem.CloseFile()
-            except Exception:
-                pass
+        WriteLog("WARNING: Saving the Navigator file failed: " + str(e))
+        WriteLog("NOTE: The maps and the targets file were written and the maps are in the Navigator in memory; save the Navigator by hand (Navigator - Save).")
+else:
+    # Add the new items to the Navigator
+
+    # They are NOT added by rewriting the whole Navigator file and reading it back in: SerialEM refuses to read a Navigator
+    # file when ANY of its items refers to a map file that cannot be found or opened, and that would keep the reference maps
+    # of this run out of the Navigator as well. The new items are written to a separate file and merged instead, because the
+    # merge reads only that file, and the Navigator is then saved.
+
+    newItemsFile = navFile + ".new"
+    newItems = navItems[navItemsExisting:]
+    try:
+        sem.SaveNavigator(navFile + "~")                    # backup unaltered nav file
+    except Exception as e:
+        WriteLog("WARNING: The backup of the Navigator file could not be written: " + str(e))
+
+    merged = False
+    try:
+        WriteNav(navHeader, newItems, newItemsFile)
+        sem.MergeNavFile(newItemsFile)
+        sem.SaveNavigator()
+        merged = True
+        WriteLog("NOTE: " + str(len(newItems)) + " items were merged into the Navigator and the Navigator file was saved. The items are also in " + newItemsFile + ".")
+        try:
+            os.remove(newItemsFile)
+        except Exception:
+            pass
+    except Exception as e:
+        WriteLog("WARNING: Adding the new maps to the Navigator failed: " + str(e))
+        WriteLog("WARNING: The " + str(len(newItems)) + " new items are in " + newItemsFile + " and can be merged by hand with Navigator - Merge File.")
+        WriteLog("WARNING: SerialEM does not read a Navigator file when one of its items refers to a map file that cannot be found or opened; this can be an item of an earlier run or one of the reference files written by this script.")
+        WriteLog("NOTE: The maps and the targets file were written before this step: " + tgtsFilePath)
+        try:
+            WriteNav(navHeader, navItems, navFile)      # fallback: the previous way, all items in the whole file
+            sem.ReadNavFile(navFile)
+            WriteLog("NOTE: The whole Navigator file was written and read back in instead (fallback).")
+        except Exception as e:
+            WriteLog("WARNING: That failed as well: " + str(e))
+        if not dummy:
+            # find out whether the files written by this script are the problem, by reading one of them back with SerialEM
+            checkBuffers = ["A"] if onlyView else ["A", "B"]
+            checkFiles = [userName + "_tgt_001_view.mrc"] if onlyView else [userName + "_tgt_001_view.mrc", userName + "_tgt_001.mrc"]
+            for checkFile, checkBuffer in zip(checkFiles, checkBuffers):
+                try:
+                    sem.OpenOldFile(os.path.join(curDir, checkFile))
+                    sem.ReadFile(0, checkBuffer)
+                    sem.CloseFile()
+                    WriteLog("NOTE: Read-back check passed for " + checkFile + ".")
+                except Exception as e:
+                    WriteLog("ERROR: SerialEM cannot read back the file written by this script: " + checkFile + " (" + str(e) + ")")
+                    WriteLog("ERROR: Navigator items that point to such a file cannot be loaded either; this is what is reported as 'items could not be read in from Navigator file'. Please report this message together with the file.")
+                try:
+                    sem.CloseFile()
+                except Exception:
+                    pass
 
 WriteLog("Target selection completed! " + str(len(targets)) + " targets were selected.")
 

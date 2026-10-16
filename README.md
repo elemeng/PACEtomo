@@ -414,6 +414,39 @@ Fixed the `switchAli` re-anchor at the first branch switch.
 
 </details>
 
+#### PACEtomo_targetsFromMontage.py [v1.17]
+In the live mode the Navigator map entries are made by SerialEM as well, so the hand-written entry machinery is not used.
+<details>
+<summary>Changes</summary>
+
+- With `liveReferences`, the reference images are saved by SerialEM and the **map entries are made by SerialEM too**: `NewMap` is called while the reference file is still open (the image has to be "saved already, or savable in the current file", and that is when the entry gets the right file name), followed by `ChangeItemLabel`, `ChangeItemNote` and `SetItemAcquire` for the first target. The entries therefore have SerialEM's own keys — `MapBinning`, `MapScaleMat`, `MapWidthHeight`, `MapMinMaxScale`, magnification, exposure, intensity — and point at the file that was written, so none of the entry-format problems of the previous versions can occur (the integer `MapBinning`, the `RealignedID` that held a table index, the self-referencing `SamePosId`).
+- The hand-written machinery (reading the Navigator file, building entries from the templates, writing and merging a file) is then **not used at all**, and the Navigator file is simply saved: nothing is rewritten and nothing is read back in, so no unreadable item anywhere in the file can keep the new maps out of the Navigator. The names of the reference files for the targets file are taken from what SerialEM actually wrote (`ReportCurrentFilename`), so a naming option that adds a prefix or postfix stays consistent.
+- The old machinery remains for the cropping mode, and both paths fall back with a warning if `NewMap` cannot be used (images not in buffer A, save/NewMap error) — the reference file is still written and the entries are then built by the script.
+
+</details>
+
+#### PACEtomo_targetsFromMontage.py [v1.16]
+In the live mode the reference images are written by SerialEM itself, so they are files exactly like camera images.
+<details>
+<summary>Changes</summary>
+
+- In the `liveReferences` mode the View and Preview images are now **saved by SerialEM** (`OpenNewFile` with the intended name, which bypasses the file properties dialog, then `Save`, then `CloseFile`) instead of being read out of the buffer and written with `mrcfile`. The reference files are then exactly like images taken by the camera: SerialEM's own MRC header with the camera values, the pixel size, the exposure and intensity, and its extended header. That removes the remaining differences in one step — no byte-converted 0..255 range, no plain-MRC2014-vs-SERI difference, and the file is written by the same code path that writes every other image of the session. `ReportCurrentFilename` is used to check the name; if SerialEM modified it, the file (and its `.mdoc`) is renamed to the name the targets file and the Navigator entries refer to, and that is logged.
+- The image kept in memory is still what feeds the Navigator entries (`MapMinMaxScale`) and the fallback: if the save fails, or if the best aligned image is not the one left in the buffer, that image is written directly as before, with a warning in the log. The `liveReferences` mode therefore never depended on the byte-conversion rescaling of v1.15, which remains in effect for the cropping mode.
+- The version reported in the log is v1.16, from the single `scriptVersion` setting.
+
+</details>
+
+#### PACEtomo_targetsFromMontage.py [v1.15]
+The cropped reference images no longer look dim: they are scaled onto the value range of the map file.
+<details>
+<summary>Changes</summary>
+
+- SerialEM loads maps **converted to bytes** for display (*Convert Maps to Bytes* in the Navigator menu, on by default, to save memory), so the map image the script reads out of the buffer has a range of 0..255 and not the values that were written to the file. A reference image cropped from it therefore looked dim next to an image SerialEM wrote from the camera: in the session that was checked, the crop held 0..255 while the map file held 0..12576, and the relation between the two fitted a straight line, confirming the byte conversion. The crops are now scaled onto the **value range stored in the map file** (new `MapFilePath` and `ReadMrcRange` helpers), so a reference has the same values and clips the same way as a camera image, and the scaling is reported in the log (`NOTE: The reference images are scaled to the value range of the map file (0.0 to 12576.0), because SerialEM loads maps converted to bytes for display.`).
+- This applies to the cropping mode only. `liveReferences` takes live images, which are already in camera values, and needs no scaling; that is one more reason to keep it on. Note what the scaling cannot recover: values the byte conversion clipped to 255 stay at the top of the range, and a map that SerialEM loaded binned gives an upsampled crop — the reference is then scaled like a camera image but not as sharp.
+- The version reported in the log is now taken from a single place (`scriptVersion`); it had stayed at v1.11 while the script moved on.
+
+</details>
+
 #### PACEtomo_targetsFromMontage.py [v1.14]
 Fixed why the Navigator items of this script could not be read back: `MapBinning` was written as `2.0`.
 <details>
