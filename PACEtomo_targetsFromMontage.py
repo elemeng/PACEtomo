@@ -3,8 +3,26 @@
 #ScriptName     PACEtomo_targetsFromMontage
 # Author:       Fabian Eisenstein
 # Created:      2022/12/09
-# Revision:     v1.12
-# Last Change:  2026/10/15: added the liveReferences mode: a real View and Preview image are taken at every point and
+# Revision:     v1.14
+# Last Change:  2026/10/16: fixed the reason why the Navigator items of this script could not be read back: MapBinning
+#               was written as "2.0" where SerialEM requires an integer (the binning comes back as a float from
+#               ImageProperties and is multiplied by the binFactor for Gatan cameras), so the reader reported every
+#               item of the run as "gave an error getting the data" and the reference maps could not be used. Both the
+#               value itself and the writer (NavValue) now emit whole numbers without a decimal point, which also
+#               repairs Navigator files written by earlier versions.
+#               2026/10/15: the new Navigator items are now added by writing them to a separate file and merging it
+#               (MergeNavFile), instead of rewriting the whole Navigator file and reading it back in. A read of the
+#               whole file fails when ANY of its items refers to a map file that cannot be found or opened, which kept
+#               the reference maps of the run out of the Navigator; the merge reads only the new items. If the merge
+#               fails, the files written by the script are read back once with OpenOldFile + ReadFile to tell whether
+#               they are the problem. WriteNav no longer consumes the item labels, so the same items can be written to
+#               the merge file and, if needed, to the whole file in the fallback.
+#               2026/10/15: every message is now also written to PACEtomo_targetsFromMontage.log in the current
+#               directory (the log window cannot be copied on the microscope), the log starts with the path and the
+#               modification time of the file that is actually running and with the mode (liveReferences or cropping),
+#               because the script is edited here but run from a copy on the microscope PC, and each point now says
+#               whether it takes live images or crops.
+#               2026/10/15: added the liveReferences mode: a real View and Preview image are taken at every point and
 #               used as its references, which removes the resampling and the padding of the virtual maps and gives the
 #               references the resolution of the live images. Before each pair of reference images the target is
 #               re-aligned to the position of the point in the map with the image shift (FindOffsetInImage locates the
@@ -60,6 +78,7 @@ refAlignTol = 0.05  # target position tolerance [microns] of the re-alignment in
 
 import serialem as sem
 import os
+import time
 import copy
 import numpy as np
 import matplotlib.pyplot as plt
@@ -128,19 +147,38 @@ def ParseNav(navFile):
         items.append(newItem)
     return header, items
 
+def NavValue(val):
+    # Values of some keys have to be integers (e.g. MapBinning, MapMagInd, MapSection): SerialEM reports the whole item
+    # as unreadable ("items could not be read in from Navigator file ... gave an error getting the data") when such a
+    # key holds "2.0" instead of "2", and then every item of that run is lost. A number that is a whole number is
+    # therefore always written without a decimal point, whether it is a number or a string read from a file, which also
+    # repairs files written by earlier versions of this script.
+    if isinstance(val, (float, np.floating)) and float(val) == int(val):
+        return str(int(val))
+    if isinstance(val, str) and "." in val:
+        try:
+            if float(val) == int(float(val)):
+                return str(int(float(val)))
+        except ValueError:
+            pass
+    return str(val)
+
 def WriteNav(header, items, filename):
+    # the items are written to a separate Navigator file, either to be merged into the Navigator or to be read back in
+    # as the whole file, so the labels and indices of the items are not consumed here
     text = ""
     for line in header:
         text += line
     text += os.linesep
-    for item in items:
+    for navItem in items:
+        item = dict(navItem)
         text += "[Item = " + item["Item"] + "]" + os.linesep
         item.pop("Item")
         item.pop("index")
         for key, attr in item.items():
             text += key + " = "
             for val in attr:
-                text += str(val) + " "
+                text += NavValue(val) + " "
             text += os.linesep
         text += os.linesep
     with open(filename, "w", newline="") as f:
@@ -163,7 +201,7 @@ def CropImage(image, coords, fov):
                 imageCrop = np.concatenate((padding, imageCrop), axis=1)
             if int(coords[1] + fov[1] / 2) > image.shape[1]:
                 imageCrop = np.concatenate((imageCrop, padding), axis=1)
-        sem.Echo("WARNING: Target position is close to the edge of the map and was padded.")
+        WriteLog("WARNING: Target position is close to the edge of the map and was padded.")
     return imageCrop
 
 def FovInSourcePixels(sizeX, sizeY, pixSize, srcPixSize):
@@ -283,19 +321,55 @@ def OffsetToStage(dy, dx, buf):
 
 ### END FUNCTIONS ###
 
+### LOG ###
+
+# Every message of this script is echoed to the SerialEM log window and written to a log file, so that a failure can
+# be reported without copying the log window. The file is created in the current directory of SerialEM (change it with
+# UserSetDirectory at the start of a run if you want it somewhere else).
+
+logPath = None
+logBuffer = []
+try:
+    logPath = os.path.join(sem.ReportDirectory(), "PACEtomo_targetsFromMontage.log")
+    open(logPath, "w").close()
+except Exception:
+    logPath = None
+
+def WriteLog(text):
+    sem.Echo(text)
+    if logPath is None:
+        logBuffer.append(text)
+        return
+    try:
+        with open(logPath, "a") as logHandle:
+            logHandle.write(text + os.linesep)
+    except Exception:
+        pass
+
+### SETTINGS DONE ###
+
 s2ssMatrix = None
 dummy = False
+try:
+    WriteLog("NOTE: Script file: " + os.path.abspath(__file__) + " (last modified " + time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(__file__))) + ")")
+except Exception:
+    WriteLog("NOTE: Script file: unknown (the script was pasted into the script window or __file__ is not available).")
+if logPath is None:
+    WriteLog("WARNING: No log file could be created in the current directory; the messages below are only in the log window.")
+else:
+    WriteLog("NOTE: Writing a log of this run to " + logPath)
+
 if sem.ReportProperty("DummyInstance") == 1:
     if not onlyView:
-        sem.Echo("WARNING: You are using SerialEM in DUMMY mode. Make sure a View image and Preview image template are available in the Navigator!")
+        WriteLog("WARNING: You are using SerialEM in DUMMY mode. Make sure a View image and Preview image template are available in the Navigator!")
     else:
-        sem.Echo("WARNING: You are using SerialEM in DUMMY mode. Make sure a View image template is available in the Navigator!")
+        WriteLog("WARNING: You are using SerialEM in DUMMY mode. Make sure a View image template is available in the Navigator!")
     dummy = True
 
 if onlyView:
-    sem.Echo("NOTE: Running in View-only mode: Only View maps will be created. Please change the setting in the script if you want to create Preview maps as well.")
+    WriteLog("NOTE: Running in View-only mode: Only View maps will be created. Please change the setting in the script if you want to create Preview maps as well.")
 
-sem.Echo("NOTE: PACEtomo_targetsFromMontage, Revision v1.11 (2026/10/15). If this line does not show the version you expect, the script that ran is not this file.")
+WriteLog("NOTE: PACEtomo_targetsFromMontage, Revision v1.11 (2026/10/15). If this line does not show the version you expect, the script that ran is not this file.")
 
 # Get nav item info
 
@@ -308,10 +382,10 @@ if drawnID == 0:
     if sem.ReportIfNavAcquiring()[0]:
         sem.SkipAcquiringNavItem()
         sem.EndAcquireAtItems()     # only available from 12-May-23
-        sem.Echo("NOTE: This nav item is not a point on a map and will be ignored.")
+        WriteLog("NOTE: This nav item is not a point on a map and will be ignored.")
         sem.Exit()
     else:
-        sem.Echo("ERROR: This nav item is not a point on a map. Make sure to save an image as a map prior to adding points!")
+        WriteLog("ERROR: This nav item is not a point on a map. Make sure to save an image as a map prior to adding points!")
         sem.Exit()
 
 # Get user input
@@ -329,6 +403,18 @@ else:
 curDir = sem.ReportDirectory()
 tgtsFilePath = os.path.join(curDir, userName + "_tgts.txt")
 
+if logPath is None:                 # no log file could be created before the user chose a directory
+    try:
+        logPath = os.path.join(curDir, "PACEtomo_targetsFromMontage.log")
+        open(logPath, "w").close()
+        for logLine in logBuffer:
+            with open(logPath, "a") as logHandle:
+                logHandle.write(logLine + os.linesep)
+        logBuffer = []
+        WriteLog("NOTE: Writing a log of this run to " + logPath)
+    except Exception:
+        logPath = None
+
 # Make sure tgts file is unique
 counter = 1
 while os.path.exists(tgtsFilePath):
@@ -336,9 +422,9 @@ while os.path.exists(tgtsFilePath):
     tgtsFilePath = os.path.join(curDir, userName + str(counter) + "_tgts.txt") 
 if counter > 1:
     userName = userName + str(counter)
-    sem.Echo("NOTE: A targets file with this name already exists, using the name " + userName + "_tgts.txt for this run.")
+    WriteLog("NOTE: A targets file with this name already exists, using the name " + userName + "_tgts.txt for this run.")
 
-sem.Echo("NOTE: Targets file of this run: " + tgtsFilePath)
+WriteLog("NOTE: Targets file of this run: " + tgtsFilePath)
 
 # Make sure nav contains template images
 
@@ -368,8 +454,8 @@ if (prevID == 0 and not onlyView) or viewID == 0:
         sem.AllowFileOverwrite(0)
     else:
         sem.OKBox("ERROR: Template for View or Preview image was not found!")
-        sem.Echo("ERROR: Template for View or Preview image was not found!")
-        sem.Echo("If you have a View and Preview image in the Navigator that you want to use as template, please change the Navigator Note to 'Template View' and 'Template Preview', respectively.")
+        WriteLog("ERROR: Template for View or Preview image was not found!")
+        WriteLog("If you have a View and Preview image in the Navigator that you want to use as template, please change the Navigator Note to 'Template View' and 'Template Preview', respectively.")
         sem.Exit()
 
 # Load templates: the virtual maps are cropped to EXACTLY the dimensions and pixel size of the real
@@ -391,7 +477,7 @@ if not onlyView:
 
     if recordPixSize == viewPixSize:
         sem.OKBox("ERROR: Template for View or Preview show the same pixel size! Make sure the maps could be loaded properly!")
-        sem.Echo("ERROR: Template for View or Preview show the same pixel size! Make sure the maps could be loaded properly!")
+        WriteLog("ERROR: Template for View or Preview show the same pixel size! Make sure the maps could be loaded properly!")
         sem.Exit()
 
 if sem.ReportCameraProperty(0, "K2Type") > 0:
@@ -438,9 +524,9 @@ except Exception:
     groupImageY = np.array([])
 
 if groupImageX.size != groupStageX.size or groupImageY.size != groupStageY.size:
-    sem.Echo("ERROR: Only " + str(groupImageX.size) + " of the " + str(groupStageX.size) + " points of this group could be placed on the map that was loaded (Navigator item " + str(drawnID) + ").")
-    sem.Echo("ERROR: All points of a group have to be added on the same map, i.e. on the same section of the same file. Points added on other maps or on other sections of a multi-section image cannot be cropped.")
-    sem.Echo("ERROR: Please add the targets of this group on one map, or split them into one group per map.")
+    WriteLog("ERROR: Only " + str(groupImageX.size) + " of the " + str(groupStageX.size) + " points of this group could be placed on the map that was loaded (Navigator item " + str(drawnID) + ").")
+    WriteLog("ERROR: All points of a group have to be added on the same map, i.e. on the same section of the same file. Points added on other maps or on other sections of a multi-section image cannot be cropped.")
+    WriteLog("ERROR: Please add the targets of this group on one map, or split them into one group per map.")
     if sem.ReportIfNavAcquiring()[0]:
         sem.SkipAcquiringNavItem()
         sem.EndAcquireAtItems()
@@ -455,14 +541,14 @@ sem.SaveNavigator()
 try:
     navFile = sem.ReportNavFile()
 except Exception as e:
-    sem.Echo("ERROR: There is no Navigator file defined (" + str(e) + ").")
-    sem.Echo("ERROR: Save the Navigator with Navigator - Save as / Save before running this script; without a file the points and their maps cannot be read.")
+    WriteLog("ERROR: There is no Navigator file defined (" + str(e) + ").")
+    WriteLog("ERROR: Save the Navigator with Navigator - Save as / Save before running this script; without a file the points and their maps cannot be read.")
     if sem.ReportIfNavAcquiring()[0]:
         sem.SkipAcquiringNavItem()
         sem.EndAcquireAtItems()
     sem.Exit()
 navHeader, navItems = ParseNav(navFile)
-sem.Echo("NOTE: Navigator file: " + navFile + " (" + str(len(navItems)) + " items)")
+WriteLog("NOTE: Navigator file: " + navFile + " (" + str(len(navItems)) + " items)")
 
 # Which map was each point of the group added on?
 
@@ -472,33 +558,33 @@ if groupPoints is not None:
     for _, pointItem in groupPoints:
         if int(pointItem["DrawnID"][0]) not in pointMaps:
             pointMaps.append(int(pointItem["DrawnID"][0]))
-    sem.Echo("NOTE: " + str(len(groupPoints)) + " point(s) in this group, added on " + str(len(pointMaps)) + " map(s).")
+    WriteLog("NOTE: " + str(len(groupPoints)) + " point(s) in this group, added on " + str(len(pointMaps)) + " map(s).")
 
     # The points on the loaded map have to get exactly the coordinates that SerialEM reports for the group, otherwise
     # the per-item coordinates (used for the points on the other maps) cannot be trusted either.
 
     onLoadedMap = [(index, item) for index, item in groupPoints if int(item["DrawnID"][0]) == drawnID]
     if len(onLoadedMap) != groupImageX.size or len(onLoadedMap) == 0:
-        sem.Echo("WARNING: The points of this group that were added on the loaded map (" + str(len(onLoadedMap)) + ") do not match the points SerialEM placed on it (" + str(groupImageX.size) + ").")
+        WriteLog("WARNING: The points of this group that were added on the loaded map (" + str(len(onLoadedMap)) + ") do not match the points SerialEM placed on it (" + str(groupImageX.size) + ").")
         groupPoints = None
     else:
         for k, (index, _) in enumerate(onLoadedMap):
             coords = PointImageCoords(index, buffer)
             if coords is None or abs(coords[0] - groupImageY[k]) > 2 or abs(coords[1] - groupImageX[k]) > 2:
-                sem.Echo("WARNING: The image coordinates that SerialEM reports for the group and for the individual items do not agree (point " + str(k + 1) + " of those on the loaded map).")
+                WriteLog("WARNING: The image coordinates that SerialEM reports for the group and for the individual items do not agree (point " + str(k + 1) + " of those on the loaded map).")
                 groupPoints = None
                 break
 
 if groupPoints is None:
-    sem.Echo("WARNING: Falling back to the coordinates that SerialEM reports for the whole group on the loaded map; points added on other maps would be placed wrongly.")
+    WriteLog("WARNING: Falling back to the coordinates that SerialEM reports for the whole group on the loaded map; points added on other maps would be placed wrongly.")
     if dummy and (groupImageX.size != groupStageX.size or groupImageY.size != groupStageY.size):
-        sem.Echo("WARNING: In DUMMY mode SerialEM cannot place the group's points on the map; they are all placed in the centre of the map, which is what the DUMMY version of the script needs.")
+        WriteLog("WARNING: In DUMMY mode SerialEM cannot place the group's points on the map; they are all placed in the centre of the map, which is what the DUMMY version of the script needs.")
         groupImageX = np.full(groupStageX.size, x / 2)
         groupImageY = np.full(groupStageY.size, y / 2)
     elif groupImageX.size != groupStageX.size or groupImageY.size != groupStageY.size:
-        sem.Echo("ERROR: Only " + str(groupImageX.size) + " of the " + str(groupStageX.size) + " points of this group could be placed on the map that was loaded (Navigator item " + str(drawnID) + ").")
-        sem.Echo("ERROR: This happens when the points of a group were added on different maps (e.g. on sections 2,3,4 of a multi-section view map), when the Navigator file and SerialEM disagree, or in DUMMY mode.")
-        sem.Echo("ERROR: Please add the targets of this group on one map, or split them into one group per map.")
+        WriteLog("ERROR: Only " + str(groupImageX.size) + " of the " + str(groupStageX.size) + " points of this group could be placed on the map that was loaded (Navigator item " + str(drawnID) + ").")
+        WriteLog("ERROR: This happens when the points of a group were added on different maps (e.g. on sections 2,3,4 of a multi-section view map), when the Navigator file and SerialEM disagree, or in DUMMY mode.")
+        WriteLog("ERROR: Please add the targets of this group on one map, or split them into one group per map.")
         if sem.ReportIfNavAcquiring()[0]:
             sem.SkipAcquiringNavItem()
             sem.EndAcquireAtItems()
@@ -522,13 +608,15 @@ alignSign = 1                # direction of the image shift correction, inverted
 stageBefore = None
 loadedMapID = None
 if liveReferences and not dummy:
-    sem.Echo("NOTE: liveReferences is on: taking a View and a Preview image at every point and re-aligning to the point in the map.")
+    WriteLog("NOTE: MODE: liveReferences - taking a View and a Preview image at every point and re-aligning to the point in the map first.")
 elif liveReferences:
-    sem.Echo("WARNING: liveReferences is on but SerialEM runs in DUMMY mode: cropping the references out of the map instead.")
+    WriteLog("WARNING: MODE: liveReferences is on, but SerialEM runs in DUMMY mode, where there is no live image to take. The reference images are therefore CROPPED out of the map, exactly as with liveReferences = False. The rest of the script (targets file, navigator items) still runs; to get real View and Preview references, run the script on the microscope.")
+if not liveReferences:
+    WriteLog("NOTE: MODE: liveReferences is off - cropping the reference images out of the map.")
 if 0 < drawnID <= len(navItems) and "MapID" in navItems[drawnID - 1]:
     loadedMapID = int(navItems[drawnID - 1]["MapID"][0])
 for i in range(groupStageX.size):
-    sem.Echo("Creating virtual map of point " + str(i + 1) + "...")
+    WriteLog("Creating virtual map of point " + str(i + 1) + "...")
 
     # Load the map this point was added on, if it is not the one already loaded, and get its position in it
     # (in the liveReferences mode it is also needed after an acquisition has used the buffer, so it is always reloaded)
@@ -545,11 +633,11 @@ for i in range(groupStageX.size):
         if pointMapID == loadedMapID:
             coords = PointImageCoords(pointIndex, buffer)
             if coords is None:
-                sem.Echo("WARNING: The position of point " + str(i + 1) + " on its map could not be obtained; its reference images are centred on the position of the map.")
+                WriteLog("WARNING: The position of point " + str(i + 1) + " on its map could not be obtained; its reference images are centred on the position of the map.")
             else:
                 pointY, pointX = coords
         else:
-            sem.Echo("WARNING: Point " + str(i + 1) + " was added on map ID " + str(pointMapID) + ", which is not in the Navigator file; using the loaded map.")
+            WriteLog("WARNING: Point " + str(i + 1) + " was added on map ID " + str(pointMapID) + ", which is not in the Navigator file; using the loaded map.")
     else:
         pointY, pointX = groupImageY[i], groupImageX[i]
 
@@ -561,6 +649,7 @@ for i in range(groupStageX.size):
 
         if stageBefore is None:
             stageBefore = sem.ReportStageXYZ()
+        WriteLog("NOTE: Taking a live View and Preview image at point " + str(i + 1) + " and re-aligning to its position in the map.")
         sem.MoveStageTo(groupStageX[i], groupStageY[i], stageZ)
         viewRef, viewRefPix, viewOffset = None, None, None
         previewRef, previewRefPix, previewOffset = None, None, None
@@ -572,23 +661,23 @@ for i in range(groupStageX.size):
             attemptImage = np.asarray(sem.bufferImage(buffer), dtype=float)
             dy, dx, quality, sharpness = FindOffsetInImage(image, (pointY, pointX), pixSize, attemptImage, attemptPix)
             if dy is None:
-                sem.Echo("WARNING: The target could not be located in the View image of point " + str(i + 1) + " (match quality " + str(round(quality, 2)) + ", peak ratio " + str(round(sharpness, 1)) + "); the reference images are taken at the requested position.")
+                WriteLog("WARNING: The target could not be located in the View image of point " + str(i + 1) + " (match quality " + str(round(quality, 2)) + ", peak ratio " + str(round(sharpness, 1)) + "); the reference images are taken at the requested position.")
                 if viewRef is None:
                     viewRef, viewRefPix = attemptImage, attemptPix
                 break
             offset = float(np.hypot(dy, dx)) * attemptPix / 1000
-            sem.Echo("NOTE: Point " + str(i + 1) + ", re-alignment attempt " + str(attempt + 1) + ": target is " + str(round(offset, 3)) + " um from the requested position (match quality " + str(round(quality, 2)) + ").")
+            WriteLog("NOTE: Point " + str(i + 1) + ", re-alignment attempt " + str(attempt + 1) + ": target is " + str(round(offset, 3)) + " um from the requested position (match quality " + str(round(quality, 2)) + ").")
             if viewOffset is None or offset < viewOffset:
                 viewRef, viewRefPix, viewOffset = attemptImage, attemptPix, offset
             if offset <= refAlignTol or attempt == 2:
                 break
             if previousOffset is not None and offset >= previousOffset:
                 alignSign = -alignSign
-                sem.Echo("WARNING: The re-alignment of point " + str(i + 1) + " did not improve; inverting the direction of the image shift correction.")
+                WriteLog("WARNING: The re-alignment of point " + str(i + 1) + " did not improve; inverting the direction of the image shift correction.")
             previousOffset = offset
             moveX, moveY = OffsetToStage(dy, dx, buffer)
             if moveX is None:
-                sem.Echo("WARNING: The image shift needed to re-align point " + str(i + 1) + " could not be calculated (BufImageToStageMatrix); the reference images are taken at the requested position.")
+                WriteLog("WARNING: The image shift needed to re-align point " + str(i + 1) + " could not be calculated (BufImageToStageMatrix); the reference images are taken at the requested position.")
                 break
             sem.ImageShiftByStageDiff(alignSign * moveX, alignSign * moveY)
             shifted = True
@@ -600,12 +689,12 @@ for i in range(groupStageX.size):
                 attemptImage = np.asarray(sem.bufferImage(buffer), dtype=float)
                 dy, dx, quality, sharpness = FindOffsetInImage(image, (pointY, pointX), pixSize, attemptImage, attemptPix)
                 if dy is None:
-                    sem.Echo("WARNING: The target could not be located in the Preview image of point " + str(i + 1) + " (match quality " + str(round(quality, 2)) + "); the reference images are taken as they are.")
+                    WriteLog("WARNING: The target could not be located in the Preview image of point " + str(i + 1) + " (match quality " + str(round(quality, 2)) + "); the reference images are taken as they are.")
                     if previewRef is None:
                         previewRef, previewRefPix = attemptImage, attemptPix
                     break
                 offset = float(np.hypot(dy, dx)) * attemptPix / 1000
-                sem.Echo("NOTE: Point " + str(i + 1) + ": target is " + str(round(offset, 3)) + " um from the centre of its Preview image (match quality " + str(round(quality, 2)) + ").")
+                WriteLog("NOTE: Point " + str(i + 1) + ": target is " + str(round(offset, 3)) + " um from the centre of its Preview image (match quality " + str(round(quality, 2)) + ").")
                 if previewOffset is None or offset < previewOffset:
                     previewRef, previewRefPix, previewOffset = attemptImage, attemptPix, offset
                 if offset <= refAlignTol or attempt == 1:
@@ -620,19 +709,19 @@ for i in range(groupStageX.size):
             sem.ResetImageShift()       # reset the image shift, moving the stage to compensate, so that the field stays put
 
         if viewRef is None:
-            sem.Echo("ERROR: No View image could be taken at point " + str(i + 1) + ".")
+            WriteLog("ERROR: No View image could be taken at point " + str(i + 1) + ".")
         else:
             viewImageProc = np.flip(viewRef, axis=0).astype(np.float32)
             viewImages.append(viewImageProc)
             WriteMrc(userName + "_tgt_" + str(i + 1).zfill(3) + "_view.mrc", viewImageProc, viewRefPix)
             if viewRef.shape != (viewSizeY, viewSizeX) or abs(viewRefPix - viewPixSize) > 0.01:
-                sem.Echo("WARNING: The View image of point " + str(i + 1) + " is " + str(viewRef.shape[1]) + "x" + str(viewRef.shape[0]) + " at " + str(round(viewRefPix, 2)) + " A/px, but the View template has " + str(viewSizeX) + "x" + str(viewSizeY) + " at " + str(round(viewPixSize, 2)) + " A/px; check the low dose View settings.")
+                WriteLog("WARNING: The View image of point " + str(i + 1) + " is " + str(viewRef.shape[1]) + "x" + str(viewRef.shape[0]) + " at " + str(round(viewRefPix, 2)) + " A/px, but the View template has " + str(viewSizeX) + "x" + str(viewSizeY) + " at " + str(round(viewPixSize, 2)) + " A/px; check the low dose View settings.")
             if not onlyView and previewRef is not None:
                 tgtImageProc = np.flip(previewRef, axis=0).astype(np.float32)
                 tgtImages.append(tgtImageProc)
                 WriteMrc(userName + "_tgt_" + str(i + 1).zfill(3) + ".mrc", tgtImageProc, previewRefPix)
                 if previewRef.shape != (recordSizeY, recordSizeX) or abs(previewRefPix - recordPixSize) > 0.01:
-                    sem.Echo("WARNING: The Preview image of point " + str(i + 1) + " is " + str(previewRef.shape[1]) + "x" + str(previewRef.shape[0]) + " at " + str(round(previewRefPix, 2)) + " A/px, but the Preview template has " + str(recordSizeX) + "x" + str(recordSizeY) + " at " + str(round(recordPixSize, 2)) + " A/px; check the low dose Preview/Record settings.")
+                    WriteLog("WARNING: The Preview image of point " + str(i + 1) + " is " + str(previewRef.shape[1]) + "x" + str(previewRef.shape[0]) + " at " + str(round(previewRefPix, 2)) + " A/px, but the Preview template has " + str(recordSizeX) + "x" + str(recordSizeY) + " at " + str(round(recordPixSize, 2)) + " A/px; check the low dose Preview/Record settings.")
     else:
         fovView = FovInSourcePixels(viewSizeX, viewSizeY, viewPixSize, pixSize)
         fovRec = FovInSourcePixels(recordSizeX, recordSizeY, recordPixSize, pixSize) if not onlyView else None
@@ -642,7 +731,7 @@ for i in range(groupStageX.size):
         # a hard edge, which biases the realignment during the collection, since PACEtomo aligns to these references.
 
         if edgeTarget:
-            sem.Echo("WARNING: Point " + str(i + 1) + " is too close to the edge of the map and its reference images are padded with artificial pixels which can bias the realignment.")
+            WriteLog("WARNING: Point " + str(i + 1) + " is too close to the edge of the map and its reference images are padded with artificial pixels which can bias the realignment.")
 
         if not onlyView:
             imageCrop = CropImage(image, (pointY, pointX), fovRec)
@@ -658,7 +747,7 @@ for i in range(groupStageX.size):
     if not dummy:
         SSX, SSY = s2ssMatrix @ np.array([groupStageX[i] - groupStageX[0], groupStageY[i] - groupStageY[0]])
         if SSX > 15 or SSY > 15:
-            sem.Echo("WARNING: Point " + str(i + 1) + " requires image shifts (" + str(round(SSX, 1)) + "|" + str(round(SSY, 1)) + ") beyond the default image shift limit (15)!")
+            WriteLog("WARNING: Point " + str(i + 1) + " requires image shifts (" + str(round(SSX, 1)) + "|" + str(round(SSY, 1)) + ") beyond the default image shift limit (15)!")
         tgt_params = {"tsfile": userName + "_ts_" + str(i + 1).zfill(3) + ".mrc", 
                     "viewfile": userName + "_tgt_" + str(i + 1).zfill(3) + "_view.mrc", 
                     "SSX": SSX, 
@@ -693,6 +782,9 @@ if not onlyView:
 ptsDX_view = np.array(np.array(templateView["PtsX"], dtype=float) - float(templateView["StageXYZ"][0]))
 ptsDY_view = np.array(np.array(templateView["PtsY"], dtype=float) - float(templateView["StageXYZ"][1]))
 
+navItemsExisting = len(navItems)
+WriteLog("NOTE: Adding the maps of the references of every target to the Navigator.")
+
 # Add maps
 
 newNavIDs = []
@@ -706,7 +798,7 @@ for i, tgt in enumerate(targets):
     viewItem["PtsY"] = ptsDY_view + tgt["stageY"]
     viewItem["MapFile"] = [os.path.join(curDir, tgt["viewfile"])]
     viewItem["Note"] = [tgt["viewfile"]]
-    viewItem["MapBinning"] = [viewBinning * binFactor]
+    viewItem["MapBinning"] = [int(viewBinning * binFactor)]        # an integer key: a float such as 2.0 makes the whole item unreadable
     viewItem["MapMinMaxScale"] = [np.min(viewImages[i]), np.max(viewImages[i])]
 
     # Create new map ID
@@ -729,7 +821,7 @@ for i, tgt in enumerate(targets):
         tgtItem["PtsX"] = ptsDX_rec + tgt["stageX"]
         tgtItem["PtsY"] = ptsDY_rec + tgt["stageY"]
         tgtItem["MapFile"] = [os.path.join(curDir, tgt["tgtfile"])]
-        tgtItem["MapBinning"] = [recordBinning * binFactor]
+        tgtItem["MapBinning"] = [int(recordBinning * binFactor)]    # an integer key, see above
         tgtItem["MapMinMaxScale"] = [np.min(tgtImages[i]), np.max(tgtImages[i])]
 
         # Create new map ID
@@ -761,7 +853,7 @@ for i, tgt in enumerate(targets):
     navItems.append(viewItem)
 
 if stageBefore is not None:
-    sem.Echo("NOTE: Returning to the stage position the script started at.")
+    WriteLog("NOTE: Returning to the stage position the script started at.")
     sem.MoveStageTo(*stageBefore)
 
 # Write tgts file
@@ -772,18 +864,59 @@ if stageBefore is not None:
 
 WriteTargets(tgtsFilePath, targets)
 
-# Write nav file
+# Add the new items to the Navigator
 
+# They are NOT added by rewriting the whole Navigator file and reading it back in: SerialEM refuses to read a Navigator
+# file when ANY of its items refers to a map file that cannot be found or opened, and that would keep the reference maps
+# of this run out of the Navigator as well. The new items are written to a separate file and merged instead, because the
+# merge reads only that file, and the Navigator is then saved.
+
+newItemsFile = navFile + ".new"
+newItems = navItems[navItemsExisting:]
 try:
-    sem.SaveNavigator(navFile + "~")        # backup unaltered nav file
-    WriteNav(navHeader, navItems, navFile)
-    sem.ReadNavFile(navFile)
-    sem.Echo("Updated navigator file with target maps.")
+    sem.SaveNavigator(navFile + "~")                    # backup unaltered nav file
 except Exception as e:
-    sem.Echo("WARNING: Updating the navigator file failed: " + str(e))
-    sem.Echo("WARNING: SerialEM does not read a Navigator file when one of its items refers to a map file that cannot be found or opened. Remove the reported items (or move their map files into the folder of the current Navigator file) and reload the Navigator file.")
-    sem.Echo("NOTE: The maps and the targets file were already written: " + tgtsFilePath)
-    sem.Echo("NOTE: The Navigator in memory was not updated and the Navigator file on disk may be incomplete; its previous content is in " + navFile + "~")
+    WriteLog("WARNING: The backup of the Navigator file could not be written: " + str(e))
 
-sem.Echo("Target selection completed! " + str(len(targets)) + " targets were selected.")
+merged = False
+try:
+    WriteNav(navHeader, newItems, newItemsFile)
+    sem.MergeNavFile(newItemsFile)
+    sem.SaveNavigator()
+    merged = True
+    WriteLog("NOTE: " + str(len(newItems)) + " items were merged into the Navigator and the Navigator file was saved. The items are also in " + newItemsFile + ".")
+    try:
+        os.remove(newItemsFile)
+    except Exception:
+        pass
+except Exception as e:
+    WriteLog("WARNING: Adding the new maps to the Navigator failed: " + str(e))
+    WriteLog("WARNING: The " + str(len(newItems)) + " new items are in " + newItemsFile + " and can be merged by hand with Navigator - Merge File.")
+    WriteLog("WARNING: SerialEM does not read a Navigator file when one of its items refers to a map file that cannot be found or opened; this can be an item of an earlier run or one of the reference files written by this script.")
+    WriteLog("NOTE: The maps and the targets file were written before this step: " + tgtsFilePath)
+    try:
+        WriteNav(navHeader, navItems, navFile)      # fallback: the previous way, all items in the whole file
+        sem.ReadNavFile(navFile)
+        WriteLog("NOTE: The whole Navigator file was written and read back in instead (fallback).")
+    except Exception as e:
+        WriteLog("WARNING: That failed as well: " + str(e))
+    if not dummy:
+        # find out whether the files written by this script are the problem, by reading one of them back with SerialEM
+        checkBuffers = ["A"] if onlyView else ["A", "B"]
+        checkFiles = [userName + "_tgt_001_view.mrc"] if onlyView else [userName + "_tgt_001_view.mrc", userName + "_tgt_001.mrc"]
+        for checkFile, checkBuffer in zip(checkFiles, checkBuffers):
+            try:
+                sem.OpenOldFile(os.path.join(curDir, checkFile))
+                sem.ReadFile(0, checkBuffer)
+                sem.CloseFile()
+                WriteLog("NOTE: Read-back check passed for " + checkFile + ".")
+            except Exception as e:
+                WriteLog("ERROR: SerialEM cannot read back the file written by this script: " + checkFile + " (" + str(e) + ")")
+                WriteLog("ERROR: Navigator items that point to such a file cannot be loaded either; this is what is reported as 'items could not be read in from Navigator file'. Please report this message together with the file.")
+            try:
+                sem.CloseFile()
+            except Exception:
+                pass
+
+WriteLog("Target selection completed! " + str(len(targets)) + " targets were selected.")
 

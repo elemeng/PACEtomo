@@ -414,6 +414,36 @@ Fixed the `switchAli` re-anchor at the first branch switch.
 
 </details>
 
+#### PACEtomo_targetsFromMontage.py [v1.14]
+Fixed why the Navigator items of this script could not be read back: `MapBinning` was written as `2.0`.
+<details>
+<summary>Changes</summary>
+
+- The binning of the reference maps went into the Navigator as **`MapBinning = 2.0`** instead of `2`: `ImageProperties` returns the binning as a float and it is multiplied by the extra `binFactor` that Gatan cameras need, so the item carried a float where SerialEM reads an integer. SerialEM then reports **every** item the run added as `N items could not be read in from Navigator file ... gave an error getting the data` (two items per target), so the reference maps of the run could not be loaded at all — while the MRC files themselves are perfectly fine. Confirmed on 2026-10-16 with the session `20261016_mSperm_wt_HTF`: editing `MapBinning = 2.0` to `MapBinning = 2` by hand made the Navigator file readable again.
+- Both the value and the writer are fixed: the binning is cast to an integer, and `NavValue` writes any number that is a whole number without a decimal point, including a value read back from a file, so a Navigator file written by an earlier version of the script is repaired when this script writes it. Values with decimals (`MapMinMaxScale`, `MapExposure`, `MapScaleMat`, `PtsX`/`PtsY`, …), notes and file paths are untouched.
+- Note for existing files: items from earlier runs still carry `MapBinning = 2.0` and keep the Navigator unreadable until those lines are corrected (or the items are deleted); the `MapFile` paths and everything else in them are fine.
+
+</details>
+
+#### PACEtomo_targetsFromMontage.py [v1.13]
+The script now writes its own log file and says which build and which mode actually ran.
+<details>
+<summary>Changes</summary>
+
+- The new Navigator items are now added by writing them to a separate file (`<navfile>.new`) and **merging** it with
+  `MergeNavFile`, instead of rewriting the whole Navigator file and reading it back in, and the Navigator is then saved. A
+  read of the whole file fails when **any** of its items refers to a map file that cannot be found or opened, which kept the
+  reference maps of the run out of the Navigator as well (and reported `N items could not be read in from Navigator file`);
+  the merge only reads the new items. If the merge fails, the script falls back to the old whole-file read, and then checks
+  whether the files it wrote itself are the problem by reading one back with `OpenOldFile` + `ReadFile`: if SerialEM cannot
+  read them, that is reported as `ERROR: SerialEM cannot read back the file written by this script`, which is the failure
+  the Navigator then reports as unreadable items. The new items stay in `<navfile>.new` so they can be merged by hand
+  (*Navigator - Merge File*) even when both paths fail.
+- Every message is written to **`PACEtomo_targetsFromMontage.log`** in the current directory of SerialEM (the one chosen with *UserSetDirectory*), in addition to the log window, so a failure can be reported by sending that file instead of copying the log window. The first lines also name the log file, so it can be found from the log window.
+- The log starts with the **path and modification time of the file that is actually running**, followed by the mode in effect: `NOTE: MODE: liveReferences - ...` or `WARNING: MODE: liveReferences is on, but SerialEM runs in DUMMY mode, where there is no live image to take. The reference images are therefore CROPPED out of the map ...`. This matters because the script is edited in the repository but run from a copy on the microscope PC: an old copy silently does the old thing, and a run in DUMMY mode cannot take real references. Each point also logs `NOTE: Taking a live View and Preview image at point N and re-aligning to its position in the map.` when the live mode is active.
+
+</details>
+
 #### PACEtomo_targetsFromMontage.py [v1.12]
 New `liveReferences` mode (default): a real View and a Preview image are taken at every target and used as its references, with the target re-aligned to its point in the map first.
 <details>
