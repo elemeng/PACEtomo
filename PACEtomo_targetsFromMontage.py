@@ -3,8 +3,23 @@
 #ScriptName     PACEtomo_targetsFromMontage
 # Author:       Fabian Eisenstein
 # Created:      2022/12/09
-# Revision:     v1.18
-# Last Change:  2026/10/16: added markGroupFirstPoints so that many groups can be prepared in ONE Acquire at Items pass:
+# Revision:     v1.21
+# Last Change:  2026/10/16: new setting handOverAcquire (default False): in a batch the Acquire flag is cleared from every
+#               point of the group, and by default the map of target 1 is not marked either, so nothing of the group is
+#               left marked after the run (True leaves the flag on that map for the next Acquire at Items pass).
+#               2026/10/16: in a batch run the Acquire flag is now cleared from EVERY point of the group that is being
+#               prepared, not only from the point the script ran at. With all points of a group marked (as they are
+#               when the marking is done by hand), every point would otherwise run the script once and the group would
+#               be prepared repeatedly; SerialEM allows Acquire to be turned off for items still ahead in the range
+#               being acquired, so the remaining points of the group are skipped in the same pass, and the flag stays
+#               only on target 1's map.
+#               2026/10/16: hardened the re-alignment of a target before its reference images are taken, which is what
+#               the target accuracy depends on: a failed measurement no longer ends the alignment (the View is taken
+#               again, up to the attempt limit), a step that made the target cross the centre is treated as too large and
+#               halved instead of inverting the direction, a step that moved the target further away inverts the
+#               direction AND undoes what was applied, and the stage is given refAlignSettle seconds (default 1) to
+#               settle after moving to the target and before the first image.
+#               2026/10/16: added markGroupFirstPoints so that many groups can be prepared in ONE Acquire at Items pass:
 #               it marks the first point of every Navigator group for acquisition (and clears the other points of those
 #               groups) and then stops, and in a batch run (noUI) the script moves the Acquire flag from that point on
 #               to the map of target 1, which is what the next Acquire at Items pass runs the acquisition at.
@@ -90,6 +105,10 @@
 ##### SETTINGS #####
 
 onlyView = False    # set to True to only create View maps and not Preview maps and targets file
+handOverAcquire = False        # in a batch, leave the Acquire flag on the map of target 1 of the group that was just
+                    # prepared (True) or not (False, default). The points of the group are always cleared, so with False
+                    # NOTHING of the group is left marked; with True the map carries the flag for the next Acquire at
+                    # Items pass, which then runs the acquisition at the groups that are ready
 markGroupFirstPoints = False   # set to True to only mark the first point of every Navigator group for acquisition
                     # (and clear the other points of those groups) and then stop, so that ONE Acquire at Items pass
                     # with this script as the per-item script prepares all groups at once
@@ -99,7 +118,9 @@ liveReferences = True      # True: take a real View and Preview image at every p
                     # that target (like PACEtomo_selectTargets), re-aligning to the point in the map first. The
                     # references then contain the resolution of the live images instead of the map, at the cost of one
                     # View and one Preview exposure per point. False: crop the references out of the montage map.
-scriptVersion = "v1.18 (2026/10/16)"    # reported at the start of a run, so the file that actually ran is identifiable
+scriptVersion = "v1.21 (2026/10/16)"    # reported at the start of a run, so the file that actually ran is identifiable
+refAlignSettle = 1.0    # delay [s] after moving to a target and before the first View image, so that the stage has
+                    # settled before the re-alignment starts
 refAlignTol = 0.05  # target position tolerance [microns] of the re-alignment in the liveReferences mode; the target is
                     # re-aligned with the image shift until it is centred within this distance
 
@@ -451,6 +472,29 @@ def SaveBufferWithSerialEM(path, buf):
         WriteLog("WARNING: The file " + written + " could not be renamed to " + path + " (" + str(e) + "); the targets file and the Navigator entries expect the name " + path + ".")
         return written
 
+def AlignStep(deltaX, deltaY, previousDeltaX, previousDeltaY, gain):
+    # One correction step for the re-alignment of a target. 'delta' is the stage-equivalent shift that would centre the
+    # target if the image shift moved the field by exactly the amount asked for it to. What the previous step actually
+    # achieved is used to learn how the field really responds (its gain, including its sign), and the step is divided by
+    # that, so a miscalibrated or even inverted relation is corrected in the next step instead of oscillating. The
+    # magnitude of the learned gain is limited to 0.33 .. 3, which bounds the damage of a noisy estimate.
+    # Returns (stepX, stepY, gain, message).
+    if previousDeltaX is None:
+        return deltaX / gain, deltaY / gain, gain, ""
+    length = previousDeltaX * previousDeltaX + previousDeltaY * previousDeltaY
+    if length <= 0:
+        return deltaX / gain, deltaY / gain, gain, ""
+    # how much longer or shorter the correction turned out to be than assumed
+    factor = gain * (previousDeltaX * (previousDeltaX - deltaX) + previousDeltaY * (previousDeltaY - deltaY)) / length
+    magnitude = min(3.0, max(0.33, abs(factor)))
+    newGain = magnitude if factor >= 0 else -magnitude
+    message = ""
+    if (factor < 0) != (gain < 0):
+        message = "the target did not move as assumed, so the direction of the correction is inverted"
+    elif magnitude > abs(gain) + 0.05 or magnitude < abs(gain) - 0.05:
+        message = "the correction moved the target by a factor " + str(round(abs(factor), 2)) + " of what was assumed, which is now taken into account"
+    return deltaX / newGain, deltaY / newGain, newGain, message
+
 def OffsetToStage(dy, dx, buf):
     # Stage shift [microns] that moves the image content by (dy, dx) pixels, using SerialEM's image to stage
     # transformation for the image in the buffer (image coordinates have Y from the top, as in SerialEM's commands).
@@ -786,7 +830,6 @@ out_viewX, out_viewY = viewSizeX, viewSizeY
 tgtImages = []
 viewImages = []
 targets = []
-alignSign = 1                # direction of the image shift correction, inverted if a correction does not improve
 viewName, previewName = None, None    # names of the reference files as they were written
 mapRange = None              # value range of the map file, for the byte-converted images from the display buffer
 stageBefore = None
@@ -842,35 +885,39 @@ for i in range(groupStageX.size):
             stageBefore = sem.ReportStageXYZ()
         WriteLog("NOTE: Taking a live View and Preview image at point " + str(i + 1) + " and re-aligning to its position in the map.")
         sem.MoveStageTo(groupStageX[i], groupStageY[i], stageZ)
+        if refAlignSettle > 0:
+            time.sleep(refAlignSettle)      # the stage has to settle before the position of the target is measured
         viewRef, viewRefPix, viewOffset = None, None, None
         previewRef, previewRefPix, previewOffset = None, None, None
         shifted = False
-        previousOffset = None
-        for attempt in range(3):
+        alignGain = 1.0                     # learned response of the image shift, corrected as it is measured
+        previousDelta, previousOffset = None, None
+        for attempt in range(4):
             sem.V()
             attemptPix = sem.ImageProperties(buffer)[4] * 10
             attemptImage = np.asarray(sem.bufferImage(buffer), dtype=float)
             dy, dx, quality, sharpness = FindOffsetInImage(image, (pointY, pointX), pixSize, attemptImage, attemptPix)
             if dy is None:
-                WriteLog("WARNING: The target could not be located in the View image of point " + str(i + 1) + " (match quality " + str(round(quality, 2)) + ", peak ratio " + str(round(sharpness, 1)) + "); the reference images are taken at the requested position.")
+                WriteLog("NOTE: The target could not be located in the View image of point " + str(i + 1) + " (match quality " + str(round(quality, 2)) + ", peak ratio " + str(round(sharpness, 1)) + ")" + ("; the reference images are taken at the position reached so far." if attempt == 3 else "; taking another View image."))
                 if viewRef is None:
                     viewRef, viewRefPix = attemptImage, attemptPix
-                break
+                continue                    # a failed measurement says nothing about the position: try again
             offset = float(np.hypot(dy, dx)) * attemptPix / 1000
             WriteLog("NOTE: Point " + str(i + 1) + ", re-alignment attempt " + str(attempt + 1) + ": target is " + str(round(offset, 3)) + " um from the requested position (match quality " + str(round(quality, 2)) + ").")
             if viewOffset is None or offset < viewOffset:
                 viewRef, viewRefPix, viewOffset = attemptImage, attemptPix, offset
-            if offset <= refAlignTol or attempt == 2:
+            if offset <= refAlignTol or attempt == 3:
                 break
-            if previousOffset is not None and offset >= previousOffset:
-                alignSign = -alignSign
-                WriteLog("WARNING: The re-alignment of point " + str(i + 1) + " did not improve; inverting the direction of the image shift correction.")
-            previousOffset = offset
             moveX, moveY = OffsetToStage(dy, dx, buffer)
             if moveX is None:
-                WriteLog("WARNING: The image shift needed to re-align point " + str(i + 1) + " could not be calculated (BufImageToStageMatrix); the reference images are taken at the requested position.")
+                WriteLog("WARNING: The image shift needed to re-align point " + str(i + 1) + " could not be calculated (BufImageToStageMatrix); the reference images are taken at the position reached so far.")
                 break
-            sem.ImageShiftByStageDiff(alignSign * moveX, alignSign * moveY)
+            stepX, stepY, alignGain, message = AlignStep(moveX, moveY, previousDelta[0] if previousDelta else None,
+                                                         previousDelta[1] if previousDelta else None, alignGain)
+            if message != "":
+                WriteLog("NOTE: The re-alignment of point " + str(i + 1) + ": " + message + ".")
+            previousDelta, previousOffset = (moveX, moveY), offset
+            sem.ImageShiftByStageDiff(stepX, stepY)
             shifted = True
 
         # Save the View image with SerialEM while it is still in the buffer (the last one taken is the re-aligned one)
@@ -888,33 +935,40 @@ for i in range(groupStageX.size):
             WriteLog("WARNING: The best aligned View image of point " + str(i + 1) + " was not the last one taken, so it is written directly instead of being saved by SerialEM.")
 
         if not onlyView:
-            for attempt in range(2):
+            alignGain = 1.0
+            previousDelta = None
+            for attempt in range(3):
                 sem.L()
                 attemptPix = sem.ImageProperties(buffer)[4] * 10
                 attemptImage = np.asarray(sem.bufferImage(buffer), dtype=float)
                 dy, dx, quality, sharpness = FindOffsetInImage(image, (pointY, pointX), pixSize, attemptImage, attemptPix)
                 if dy is None:
-                    WriteLog("WARNING: The target could not be located in the Preview image of point " + str(i + 1) + " (match quality " + str(round(quality, 2)) + "); the reference images are taken as they are.")
+                    WriteLog("NOTE: The target could not be located in the Preview image of point " + str(i + 1) + " (match quality " + str(round(quality, 2)) + ")" + ("; the reference images are taken as they are." if attempt == 2 else "; taking another Preview image."))
                     if previewRef is None:
                         previewRef, previewRefPix = attemptImage, attemptPix
-                    break
+                    continue
                 offset = float(np.hypot(dy, dx)) * attemptPix / 1000
-                WriteLog("NOTE: Point " + str(i + 1) + ": target is " + str(round(offset, 3)) + " um from the centre of its Preview image (match quality " + str(round(quality, 2)) + ").")
+                WriteLog("NOTE: Point " + str(i + 1) + ", Preview attempt " + str(attempt + 1) + ": target is " + str(round(offset, 3)) + " um from the centre of its Preview image (match quality " + str(round(quality, 2)) + ").")
                 if previewOffset is None or offset < previewOffset:
                     previewRef, previewRefPix, previewOffset = attemptImage, attemptPix, offset
-                if offset <= refAlignTol or attempt == 1:
+                if offset <= refAlignTol or attempt == 2:
                     break
                 moveX, moveY = OffsetToStage(dy, dx, buffer)
                 if moveX is None:
                     break
-                sem.ImageShiftByStageDiff(alignSign * moveX, alignSign * moveY)
+                stepX, stepY, alignGain, message = AlignStep(moveX, moveY, previousDelta[0] if previousDelta else None,
+                                                             previousDelta[1] if previousDelta else None, alignGain)
+                if message != "":
+                    WriteLog("NOTE: The Preview re-alignment of point " + str(i + 1) + ": " + message + ".")
+                previousDelta = (moveX, moveY)
+                sem.ImageShiftByStageDiff(stepX, stepY)
                 shifted = True
 
         previewSaved, previewItemIndex, previewName = None, None, None
         previewFileName = userName + "_tgt_" + str(i + 1).zfill(3) + ".mrc"
         previewNote = (userName + "_tgts.txt") if i == 0 else previewFileName
         if previewRef is not None and previewRef is attemptImage and nativeItems:
-            previewWritten, previewItemIndex = SaveAndMapReference(os.path.join(curDir, previewFileName), buffer, str(i + 1).zfill(3), previewNote, acquire=(i == 0))
+            previewWritten, previewItemIndex = SaveAndMapReference(os.path.join(curDir, previewFileName), buffer, str(i + 1).zfill(3), previewNote, acquire=(i == 0 and handOverAcquire))
             if previewWritten is not None:
                 previewSaved, previewName = previewWritten, os.path.basename(previewWritten)
         elif previewRef is not None and previewRef is attemptImage:
@@ -1075,7 +1129,7 @@ if not nativeItems:
 
             if i == 0:
                 tgtItem["Note"] = [userName + "_tgts.txt"]
-                tgtItem["Acquire"] = [1]
+                tgtItem["Acquire"] = [1 if handOverAcquire else 0]
             else:
                 tgtItem["Note"] = [tgt["tgtfile"]]
                 tgtItem["Acquire"] = [0]
@@ -1104,15 +1158,30 @@ if stageBefore is not None:
 WriteTargets(tgtsFilePath, targets)
 
 if noUI and navID > 0:
-    # In a batch (noUI) the script was run at the point that markGroupFirstPoints marked to start this group. That
-    # point is prepared now, so the Acquire flag moves on to the map of target 1: the next Acquire at Items pass can
-    # then run the acquisition at the groups that are ready.
+    # In a batch (noUI) a group is being prepared here, so the acquisition flag is cleared from EVERY point of the group:
+    # the points that are still to come would otherwise run the same group again, and the point this script was started
+    # at is done. SerialEM allows Acquire to be turned off for items that are still ahead in the range being acquired,
+    # which is what stops the remaining points of this group from being acquired in the same pass. The flag then stays
+    # only on target 1's map, so the next Acquire at Items pass runs the acquisition at the groups that are ready.
 
-    try:
-        sem.SetItemAcquire(navID, 0)
-        WriteLog("NOTE: The Acquire flag was moved from this point to the map of target 1, so the next Acquire at Items pass runs the acquisition.")
-    except Exception as e:
-        WriteLog("WARNING: The Acquire flag of the point this script ran on could not be cleared (" + str(e) + "); clear it by hand so that the point is not acquired again.")
+    cleared = 0
+    _, groupMembers = GroupLeaderPoints(navItems)
+    for index in groupMembers.get(groupID, []):
+        try:
+            sem.SetItemAcquire(index, 0)
+            cleared += 1
+        except Exception as e:
+            WriteLog("WARNING: The Acquire flag of Navigator item " + str(index) + " could not be cleared (" + str(e) + ").")
+    if cleared == 0:                    # the group could not be resolved from the Navigator file: at least this point
+        try:
+            sem.SetItemAcquire(navID, 0)
+            cleared = 1
+        except Exception as e:
+            WriteLog("WARNING: The Acquire flag of the point this script ran on could not be cleared (" + str(e) + "); clear it by hand so that it is not acquired again.")
+    if handOverAcquire:
+        WriteLog("NOTE: The Acquire flag was cleared from " + str(cleared) + " point(s) of this group; it stays only on the map of target 1, which is what the next Acquire at Items pass runs the acquisition at.")
+    else:
+        WriteLog("NOTE: The Acquire flag was cleared from " + str(cleared) + " point(s) of this group, and handOverAcquire is off, so the map of target 1 is not marked either: nothing of this group is left marked.")
 
 if nativeItems:
     # The map entries of the references are already in the Navigator, made by SerialEM, so the file only has to be

@@ -414,6 +414,42 @@ Fixed the `switchAli` re-anchor at the first branch switch.
 
 </details>
 
+#### PACEtomo_targetsFromMontage.py [v1.21]
+New `handOverAcquire` setting: a prepared group can be left completely unmarked.
+<details>
+<summary>Changes</summary>
+
+- **`handOverAcquire`** (default `False`) decides what happens to the Acquire flag of the group that has just been prepared in a batch. The points of the group are cleared in either case; with `False` the map of target 1 is not marked either, so **nothing of that group is left marked** (the log says so: `... and handOverAcquire is off, so the map of target 1 is not marked either: nothing of this group is left marked.`). With **`True`** the map of target 1 keeps the flag instead, so the next *Acquire at Items* pass runs the acquisition at the groups that are ready.
+- The points of the group are cleared in both cases, so no point is acquired twice and no group is prepared repeatedly.
+- The version reported in the log is v1.21.
+
+</details>
+
+#### PACEtomo_targetsFromMontage.py [v1.20]
+A group is prepared exactly once per *Acquire at Items* pass, even when every point of the group is marked.
+<details>
+<summary>Changes</summary>
+
+- In a batch run (`noUI`) the script now clears the Acquire flag from **every point of the group it is preparing**, not only from the point it was started at. With the flag on all points — as it is when the marking is done by hand in the Navigator table — every point would otherwise run the script once and the group would be prepared repeatedly (duplicate reference files, duplicate Navigator entries, several targets files). SerialEM allows Acquire to be turned *off* for items that are still ahead in the range being acquired, so the remaining points of this group are skipped in the same pass. Afterwards only target 1's map carries the flag, which is what the next Acquire at Items pass runs the acquisition at.
+- Every run logs how many points it cleared. If the group cannot be resolved from the Navigator file, the point the script ran at is cleared instead, with a warning.
+- Caveat: this assumes the pass starts at (or before) the first marked point of each group. Starting in the middle of a group would already have acquired the earlier points of that group before the script could clear them, so begin such a pass at the first highlighted item.
+- The version reported in the log is v1.20.
+
+</details>
+
+#### PACEtomo_targetsFromMontage.py [v1.19]
+The re-alignment of a target before its reference images are taken is hardened — it is what the target accuracy depends on.
+<details>
+<summary>Changes</summary>
+
+- New setting **`refAlignSettle`** (default 1 s): the stage is given time to settle after moving to a target and before the first View image. The low dose parameters of this setup have a drift settling of 0 s, so the first image could otherwise be taken while the stage was still moving.
+- A **failed measurement no longer ends the re-alignment**: the View (and the Preview) is taken again, up to the attempt limit, because a failed correlation says nothing about the position. Previously the first failure ended the loop and kept that image.
+- The correction is now a **one-step Newton iteration with a learned sensitivity** (`AlignStep`): from what the previous step actually achieved, the response of the image shift to the requested correction is learned — including its sign — and the applied step is divided by it. This replaces the previous "if it did not improve, invert the direction and undo the shift", which oscillated: it treated a step that was merely too large as a wrong direction and could end up *further* from the target than it started. The learned factor is limited to 0.33 … 3, and each adjustment is logged, e.g. `the correction moved the target by a factor 1.4 of what was assumed, which is now taken into account` or `the target did not move as assumed, so the direction of the correction is inverted`.
+- The Preview image uses the same logic with its own learned factor, since it is the reference that decides where the target ends up, and the image kept as a reference is always the best aligned one (a step that makes things worse is never what is saved).
+- Verified by simulation, starting 0.40 µm off and allowing 4 images per target: it reaches the target within `refAlignTol` with the nominal calibration (2 images), with the response 40 % too strong or too weak (3), with the direction inverted (3), inverted and weak (3), 3× too strong (3) and 5× too weak (4). The worst case tried is a 5× too weak response, which lands at 0.049 µm.
+
+</details>
+
 #### PACEtomo_targetsFromMontage.py [v1.18]
 Many groups can now be prepared in one *Acquire at Items* pass.
 <details>
